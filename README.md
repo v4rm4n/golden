@@ -1,10 +1,19 @@
 #  Golden
 
-![Golden](/_docs/golden_logoonly_nobg.png)
+<p align="center">
+  <img src="./_docs/golden_logoonly_nobg.png" alt="Golden" width="200"/>
+</p>
 
-**Golden: Authentic Go syntax, zero garbage collection.** A high-performance transpiler targeting Odin with ARC for deterministic, systems-level power.
+<p style="font-size: 20px;">
+  <strong>Authentic Go syntax, zero garbage collection.</strong>
+  A high-performance transpiler targeting Odin with ARC for deterministic, systems-level power.
+</p>
 
-## 📁 Project Structure
+## 🎯 Vision
+
+The systems programming world is currently split. On one side, you have Rust: undeniably powerful, but heavily bogged down by steep learning curves, slow compile times, and constant cognitive friction with the borrow checker. On the other side, you have Go: an absolute joy to write with a massive ecosystem, but disqualified from true real-time, high-performance, or game-engine domains due to the unpredictable latency of its Garbage Collector. 
+
+**Golden is my ambition to merge these two worlds.** It bridges the gap between a ubiquitous, high-level language and a niche, brutally fast systems compiler. By taking Go's clean syntax and mapping it directly to Odin's low-level metal—swapping out the GC for deterministic ARC and Arena allocators—Golden gives you the developer experience and ecosystem of Go, backed by the uncompromising, hard-mode power of Odin.
 
 ## 📁 Project Structure
 
@@ -32,7 +41,7 @@ cd out && odin run .
 
 ## 🛠 Current Status
 
-### Phase 1: The Translator
+### Phase 1: Translator
 
 [x] Authentic Go AST parsing
 
@@ -50,7 +59,7 @@ cd out && odin run .
 
 [x] Auto-injected defer statements for deterministic GC-free cleanup
 
-### Phase 3: The Engine (Concurrency)
+### Phase 3: Engine (Concurrency)
 
 [x] Custom Odin Work-Stealing Scheduler (Task Pool)
 
