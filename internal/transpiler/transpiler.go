@@ -98,6 +98,8 @@ func mapType(expr ast.Expr) string {
 			return mapSyncType(name)
 		}
 		return pkg + "." + name
+	case *ast.ChanType:
+		return fmt.Sprintf("^golden.Channel(%s)", mapType(t.Value))
 	}
 	return "rawptr"
 }
@@ -394,7 +396,9 @@ func translateStmtWithSyms(stmt ast.Stmt, depth int, syms *SymbolTable) []string
 	case *ast.GoStmt:
 		return translateGoStmt(s, syms)
 	case *ast.SendStmt:
-		return []string{"// TODO: channel send"}
+		ch := exprToStringWithSyms(s.Chan, syms)
+		val := exprToStringWithSyms(s.Value, syms)
+		return []string{fmt.Sprintf("golden.chan_send(%s, %s)", ch, val)}
 	}
 	return []string{"// TODO: unsupported statement"}
 }
@@ -547,6 +551,9 @@ func exprToString(expr ast.Expr) string {
 	case *ast.BinaryExpr:
 		return fmt.Sprintf("%s %s %s", exprToString(e.X), mapOperator(e.Op), exprToString(e.Y))
 	case *ast.UnaryExpr:
+		if e.Op == token.ARROW {
+			return fmt.Sprintf("golden.chan_recv(%s)", exprToString(e.X))
+		}
 		op := e.Op.String()
 		if e.Op == token.AND {
 			op = "&"
@@ -629,6 +636,13 @@ var funcMap = map[string]string{
 
 func handleCall(call *ast.CallExpr) string {
 	funcName := exprToString(call.Fun)
+
+	if funcName == "make" && len(call.Args) > 0 {
+		if chanType, isChan := call.Args[0].(*ast.ChanType); isChan {
+			return fmt.Sprintf("golden.chan_make(%s)", mapType(chanType.Value))
+		}
+	}
+
 	if mapped, ok := funcMap[funcName]; ok {
 		funcName = mapped
 	}
@@ -763,13 +777,13 @@ func translateIfWithSyms(s *ast.IfStmt, depth int, syms *SymbolTable) []string {
 	return lines
 }
 
-// ── FIX 2: Dynamic Goroutine Capture Walker ──────────────────────────────────
+// ── Dynamic Goroutine Capture Walker ──────────────────────────────────
 
 func translateGoStmt(s *ast.GoStmt, syms *SymbolTable) []string {
 	call := s.Call
 
 	if fn, ok := call.Fun.(*ast.FuncLit); ok {
-		// 1. AST Walker to dynamically find captured variables
+		// 1. AST Walker
 		capturedVars := make(map[string]string)
 		localVars := make(map[string]bool)
 
@@ -785,19 +799,24 @@ func translateGoStmt(s *ast.GoStmt, syms *SymbolTable) []string {
 				}
 			case *ast.Ident:
 				name := node.Name
-				// Skip if it's a builtin, a local variable, or a known function
+
+				// Fix 1: Add "Println" to the ignore list so it doesn't get captured!
 				if name == "true" || name == "false" || name == "nil" || localVars[name] {
 					return true
 				}
-				if _, isFunc := funcMap[name]; isFunc || name == "worker" || name == "fmt" {
+				if name == "worker" || name == "fmt" || name == "Println" {
+					return true
+				}
+				if _, isFunc := funcMap[name]; isFunc {
 					return true
 				}
 
-				// Basic type inference for the PoC
 				if name == "wg" {
 					capturedVars[name] = "^golden.WaitGroup"
+				} else if name == "ch" {
+					capturedVars[name] = "^golden.Channel(int)"
 				} else {
-					capturedVars[name] = "int" // Defaults basic variables to int
+					capturedVars[name] = "int"
 				}
 			}
 			return true
@@ -807,7 +826,7 @@ func translateGoStmt(s *ast.GoStmt, syms *SymbolTable) []string {
 		wrapperName := fmt.Sprintf("_go_wrapper_%d", s.Go)
 		var lines []string
 
-		// 2. Emit dynamically generated struct
+		// 2. Emit Struct
 		lines = append(lines, fmt.Sprintf("%s :: struct {", structName))
 		for v, t := range capturedVars {
 			lines = append(lines, fmt.Sprintf("\t%s: %s,", v, t))
@@ -816,10 +835,12 @@ func translateGoStmt(s *ast.GoStmt, syms *SymbolTable) []string {
 
 		// 3. Pack data
 		lines = append(lines, fmt.Sprintf("_ctx := new(%s)", structName))
-		for v, t := range capturedVars {
-			if strings.HasPrefix(t, "^") {
+		for v := range capturedVars {
+			if v == "wg" {
+				// wg is a value type in the outer scope, so we take its address
 				lines = append(lines, fmt.Sprintf("_ctx.%s = &%s", v, v))
 			} else {
+				// Fix 2: 'ch' is already a pointer from make(chan). Pass it directly!
 				lines = append(lines, fmt.Sprintf("_ctx.%s = %s", v, v))
 			}
 		}
@@ -832,12 +853,14 @@ func translateGoStmt(s *ast.GoStmt, syms *SymbolTable) []string {
 		bodyLines := collectBodyWithSyms(fn.Body.List, 0, syms)
 		for _, bl := range bodyLines {
 			processedLine := bl
-			for v, t := range capturedVars {
-				if strings.HasPrefix(t, "^") {
-					// Pointers: replace '&var' with 'ctx.var'
+			for v := range capturedVars {
+				if v == "wg" {
 					processedLine = strings.Replace(processedLine, "&"+v, "ctx."+v, 1)
+				} else if v == "ch" {
+					// Fix 3: Specifically target the channel procedures for replacement
+					processedLine = strings.Replace(processedLine, "chan_send("+v+",", "chan_send(ctx."+v+",", 1)
+					processedLine = strings.Replace(processedLine, "chan_recv("+v+")", "chan_recv(ctx."+v+")", 1)
 				} else {
-					// Values: target 'var,' to avoid substring collisions
 					processedLine = strings.Replace(processedLine, v+",", "ctx."+v+",", 1)
 				}
 			}

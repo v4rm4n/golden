@@ -109,7 +109,8 @@ queue_push :: proc(q: ^TaskQueue, t: Task) {
         sync.cond_wait(&q.not_full, &q.mu)
     }
     if !q.closed {
-        q.tasks[q.head %% MAX_TASKS] = t
+    // OPTIMIZATION: Bitwise AND for power-of-2 ring buffer
+        q.tasks[q.head & (MAX_TASKS - 1)] = t
         q.head += 1
         sync.cond_signal(&q.not_empty)
     }
@@ -125,7 +126,8 @@ queue_pop :: proc(q: ^TaskQueue) -> (Task, bool) {
         sync.mutex_unlock(&q.mu)
         return {}, false
     }
-    t := q.tasks[q.tail %% MAX_TASKS]
+    // OPTIMIZATION: Bitwise AND for power-of-2 ring buffer
+    t := q.tasks[q.tail & (MAX_TASKS - 1)]
     q.tail += 1
     sync.cond_signal(&q.not_full)
     sync.mutex_unlock(&q.mu)
@@ -220,4 +222,46 @@ wg_wait :: proc(wg: ^WaitGroup) {
 // Used by the transpiler for goroutines that capture arguments.
 spawn_raw :: proc(fn: proc(rawptr), data: rawptr) {
     queue_push(&_pool.queue, Task{fn = fn, data = data})
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// CHANNELS (Unbuffered Rendezvous)
+// ═══════════════════════════════════════════════════════════════════
+
+Channel :: struct($T: typeid) {
+    data:      T,
+    has_data:  bool,
+    mu:        sync.Mutex,   // zero-init
+    not_empty: sync.Cond,    // zero-init
+    not_full:  sync.Cond,    // zero-init
+}
+
+// chan_make allocates a new generic channel on the heap
+chan_make :: proc($T: typeid) -> ^Channel(T) {
+    return new(Channel(T))
+}
+
+// chan_send blocks until the channel is empty, then writes data
+chan_send :: proc(c: ^Channel($T), val: T) {
+    sync.mutex_lock(&c.mu)
+    for c.has_data {
+        sync.cond_wait(&c.not_full, &c.mu)
+    }
+    c.data = val
+    c.has_data = true
+    sync.cond_signal(&c.not_empty)
+    sync.mutex_unlock(&c.mu)
+}
+
+// chan_recv blocks until the channel has data, then reads it
+chan_recv :: proc(c: ^Channel($T)) -> T {
+    sync.mutex_lock(&c.mu)
+    for !c.has_data {
+        sync.cond_wait(&c.not_empty, &c.mu)
+    }
+    val := c.data
+    c.has_data = false
+    sync.cond_signal(&c.not_full)
+    sync.mutex_unlock(&c.mu)
+    return val
 }
