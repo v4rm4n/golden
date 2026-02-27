@@ -1,4 +1,4 @@
-// --- golden/cmd/golden/main.odin ---
+// --- golden/cmd/golden/main.go ---
 
 package main
 

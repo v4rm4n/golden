@@ -1,11 +1,14 @@
+// --- golden/runtime/golden.odin ---
+
 package golden
 
 import "core:fmt"
 import "core:mem"
+import "core:sync"
+import "core:thread"
 
 // ═══════════════════════════════════════════════════════════════════
 // ARC — Automatic Reference Counting
-// Used for allocations that ESCAPE their declaring function scope.
 // ═══════════════════════════════════════════════════════════════════
 
 Arc :: struct($T: typeid) {
@@ -37,46 +40,184 @@ release :: proc(a: Arc($T)) {
 
 // ═══════════════════════════════════════════════════════════════════
 // ARENA — Frame Allocator
-// Used for LOCAL allocations that never escape their function scope.
-// One pointer bump to alloc. One pointer reset to free ALL. O(1).
 // ═══════════════════════════════════════════════════════════════════
 
-FRAME_SIZE :: 1024 * 64  // 64KB per frame
+FRAME_SIZE :: 1024 * 64
 
 Frame :: struct {
     buf:    [FRAME_SIZE]byte,
     offset: int,
 }
 
-frame_begin :: proc() -> Frame {
-    return Frame{}
-}
+frame_begin :: proc() -> Frame { return Frame{} }
 
 frame_end :: proc(f: ^Frame) {
     f.offset = 0
-    fmt.println("[golden] frame freed")
 }
 
-// Allocate T inside the frame — bump pointer, no heap.
 frame_new :: proc(value: $T, f: ^Frame) -> ^T {
-    size  := size_of(T)
-    align := align_of(T)
+    size    := size_of(T)
+    align   := align_of(T)
     aligned := (f.offset + align - 1) & ~(align - 1)
-
     if aligned + size > FRAME_SIZE {
-        fmt.println("[golden] frame overflow → heap fallback for", typeid_of(T))
         d := new(T)
         d^ = value
         return d
     }
-
     ptr := cast(^T)&f.buf[aligned]
     ptr^ = value
     f.offset = aligned + size
     return ptr
 }
 
-// Set fields on an arena pointer after allocation.
-frame_init :: proc(ptr: ^$T, value: T) {
-    ptr^ = value
+frame_init :: proc(ptr: ^$T, value: T) { ptr^ = value }
+
+// ═══════════════════════════════════════════════════════════════════
+// TASK POOL — Goroutine Scheduler
+// ═══════════════════════════════════════════════════════════════════
+
+MAX_TASKS   :: 1024
+MAX_THREADS :: 32
+
+Task :: struct {
+    fn:   proc(rawptr),
+    data: rawptr,
+}
+
+TaskQueue :: struct {
+    tasks:     [MAX_TASKS]Task,
+    head:      int,
+    tail:      int,
+    mu:        sync.Mutex,   // zero-init, no init call needed
+    not_empty: sync.Cond,    // zero-init, no init call needed
+    not_full:  sync.Cond,    // zero-init, no init call needed
+    closed:    bool,
+}
+
+Pool :: struct {
+    queue:   TaskQueue,
+    threads: [MAX_THREADS]^thread.Thread,
+    count:   int,
+    running: bool,
+}
+
+_pool: Pool
+
+queue_push :: proc(q: ^TaskQueue, t: Task) {
+    sync.mutex_lock(&q.mu)
+    for (q.head - q.tail) >= MAX_TASKS && !q.closed {
+        sync.cond_wait(&q.not_full, &q.mu)
+    }
+    if !q.closed {
+        q.tasks[q.head %% MAX_TASKS] = t
+        q.head += 1
+        sync.cond_signal(&q.not_empty)
+    }
+    sync.mutex_unlock(&q.mu)
+}
+
+queue_pop :: proc(q: ^TaskQueue) -> (Task, bool) {
+    sync.mutex_lock(&q.mu)
+    for q.head == q.tail && !q.closed {
+        sync.cond_wait(&q.not_empty, &q.mu)
+    }
+    if q.head == q.tail {
+        sync.mutex_unlock(&q.mu)
+        return {}, false
+    }
+    t := q.tasks[q.tail %% MAX_TASKS]
+    q.tail += 1
+    sync.cond_signal(&q.not_full)
+    sync.mutex_unlock(&q.mu)
+    return t, true
+}
+
+queue_close :: proc(q: ^TaskQueue) {
+    sync.mutex_lock(&q.mu)
+    q.closed = true
+    sync.cond_broadcast(&q.not_empty)
+    sync.cond_broadcast(&q.not_full)
+    sync.mutex_unlock(&q.mu)
+}
+
+_worker_proc :: proc(t: ^thread.Thread) {
+    for {
+        task, ok := queue_pop(&_pool.queue)
+        if !ok { return }
+        task.fn(task.data)
+    }
+}
+
+pool_start :: proc(n: int) {
+    _pool.count   = min(n, MAX_THREADS)
+    _pool.running = true
+    // TaskQueue is zero-initialized — Mutex and Cond need no explicit init
+    for i in 0..<_pool.count {
+        t := thread.create(_worker_proc)
+        _pool.threads[i] = t
+        thread.start(t)
+    }
+}
+
+pool_stop :: proc() {
+    queue_close(&_pool.queue)
+    for i in 0..<_pool.count {
+        thread.join(_pool.threads[i])
+        thread.destroy(_pool.threads[i])
+    }
+    _pool.running = false
+}
+
+spawn :: proc(fn: proc()) {
+    fn_copy := new(proc())
+    fn_copy^ = fn
+    queue_push(&_pool.queue, Task{
+        fn = proc(data: rawptr) {
+            f := cast(^proc())data
+            f^()
+            free(f)
+        },
+        data = fn_copy,
+    })
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// WAITGROUP
+// ═══════════════════════════════════════════════════════════════════
+
+WaitGroup :: struct {
+    mu:    sync.Mutex,   // zero-init
+    cond:  sync.Cond,    // zero-init
+    count: int,
+}
+
+// wg_init is a no-op — WaitGroup is zero-initialized.
+// Kept so transpiler-injected calls compile without error.
+wg_init :: proc(wg: ^WaitGroup) {}
+
+wg_add :: proc(wg: ^WaitGroup, delta: int) {
+    sync.mutex_lock(&wg.mu)
+    wg.count += delta
+    if wg.count == 0 {
+        sync.cond_broadcast(&wg.cond)
+    }
+    sync.mutex_unlock(&wg.mu)
+}
+
+wg_done :: proc(wg: ^WaitGroup) {
+    wg_add(wg, -1)
+}
+
+wg_wait :: proc(wg: ^WaitGroup) {
+    sync.mutex_lock(&wg.mu)
+    for wg.count > 0 {
+        sync.cond_wait(&wg.cond, &wg.mu)
+    }
+    sync.mutex_unlock(&wg.mu)
+}
+
+// spawn_raw submits a proc(rawptr) with a data pointer.
+// Used by the transpiler for goroutines that capture arguments.
+spawn_raw :: proc(fn: proc(rawptr), data: rawptr) {
+    queue_push(&_pool.queue, Task{fn = fn, data = data})
 }
