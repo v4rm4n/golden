@@ -11,7 +11,29 @@ import (
 
 // ── Top-level processor ──────────────────────────────────────────────────────
 
+// funcReturnTypes maps function name → Arc type name for functions
+// that return *T (pointer types). Built during Process, used by handleFunc
+// to mark call-result variables as Arc in the symbol table.
+var funcReturnTypes = map[string]string{}
+
 func Process(f *ast.File) string {
+	// ── Pre-pass: build funcReturnTypes from all FuncDecls ───────────────────
+	funcReturnTypes = make(map[string]string)
+	for _, decl := range f.Decls {
+		fd, ok := decl.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+		if fd.Type.Results == nil || len(fd.Type.Results.List) == 0 {
+			continue
+		}
+		// If first return type is *T, record it
+		first := fd.Type.Results.List[0].Type
+		if star, ok := first.(*ast.StarExpr); ok {
+			funcReturnTypes[fd.Name.Name] = mapType(star.X)
+		}
+	}
+
 	var sb strings.Builder
 	sb.WriteString("package main\n\n")
 	sb.WriteString("import \"core:fmt\"\n")
@@ -41,18 +63,30 @@ func mapType(expr ast.Expr) string {
 
 	case *ast.Ident:
 		switch t.Name {
-		case "int":     return "int"
-		case "int32":   return "i32"
-		case "int64":   return "i64"
-		case "uint":    return "uint"
-		case "string":  return "string"
-		case "bool":    return "b8"
-		case "float32": return "f32"
-		case "float64": return "f64"
-		case "byte":    return "byte"
-		case "rune":    return "rune"
-		case "error":   return "string" // simplified; full error interface comes later
-		default:        return t.Name
+		case "int":
+			return "int"
+		case "int32":
+			return "i32"
+		case "int64":
+			return "i64"
+		case "uint":
+			return "uint"
+		case "string":
+			return "string"
+		case "bool":
+			return "b8"
+		case "float32":
+			return "f32"
+		case "float64":
+			return "f64"
+		case "byte":
+			return "byte"
+		case "rune":
+			return "rune"
+		case "error":
+			return "string" // simplified; full error interface comes later
+		default:
+			return t.Name
 		}
 
 	// *T  →  ^T
@@ -103,59 +137,135 @@ func handleStruct(d *ast.GenDecl) string {
 
 // ── Symbol Table ─────────────────────────────────────────────────────────────
 
-// SymbolTable tracks which variables are Arc-managed in the current function.
+// AllocStrategy tells the transpiler which allocator to use for a variable.
+type AllocStrategy int
+
+const (
+	AllocARC   AllocStrategy = iota // escapes scope → golden.make_arc
+	AllocArena                      // local only    → golden.frame_alloc
+)
+
+// SymbolTable tracks all heap-allocated variables in the current function.
 type SymbolTable struct {
-	arcVars map[string]string // varName → underlying type e.g. "u" → "User"
+	arcVars    map[string]string        // varName → underlying type
+	strategy   map[string]AllocStrategy // varName → ARC or Arena
+	needsFrame bool                     // true if any arena allocs exist
 }
 
 func newSymbolTable() *SymbolTable {
-	return &SymbolTable{arcVars: make(map[string]string)}
+	return &SymbolTable{
+		arcVars:  make(map[string]string),
+		strategy: make(map[string]AllocStrategy),
+	}
 }
 
 func (s *SymbolTable) markArc(name, typeName string) {
 	s.arcVars[name] = typeName
+	s.strategy[name] = AllocARC
+}
+
+func (s *SymbolTable) markArena(name, typeName string) {
+	s.arcVars[name] = typeName
+	s.strategy[name] = AllocArena
+	s.needsFrame = true
 }
 
 func (s *SymbolTable) isArc(name string) bool {
-	_, ok := s.arcVars[name]
-	return ok
+	st, ok := s.strategy[name]
+	return ok && st == AllocARC
+}
+
+func (s *SymbolTable) strategyOf(name string) AllocStrategy {
+	if st, ok := s.strategy[name]; ok {
+		return st
+	}
+	return AllocARC // safe default
 }
 
 // ── Function Handler ─────────────────────────────────────────────────────────
 
 func handleFunc(d *ast.FuncDecl) string {
-	var sb strings.Builder
-
 	// Symbol table is per-function scope
 	syms := newSymbolTable()
 
-	// Parameters — *T params become golden.Arc(T)
+	// ── Parameters — *T becomes ^T (borrow, not own) ─────────────────────────
 	var params []string
 	if d.Type.Params != nil {
 		for _, field := range d.Type.Params.List {
-			if star, ok := field.Type.(*ast.StarExpr); ok {
-				typeName := mapType(star.X)
-				for _, pName := range field.Names {
-					syms.markArc(pName.Name, typeName)
-					params = append(params,
-						fmt.Sprintf("%s: golden.Arc(%s)", pName.Name, typeName))
+			pType := mapType(field.Type) // *T → ^T naturally
+			for _, pName := range field.Names {
+				if _, ok := field.Type.(*ast.StarExpr); ok {
+					// Mark as arena so .data is NOT injected on field access
+					syms.markArena(pName.Name, pType)
 				}
-			} else {
-				pType := mapType(field.Type)
-				for _, pName := range field.Names {
-					params = append(params,
-						fmt.Sprintf("%s: %s", pName.Name, pType))
+				params = append(params, fmt.Sprintf("%s: %s", pName.Name, pType))
+			}
+		}
+	}
+
+	// Collect raw return types — resolved after escape analysis below
+	rawResults := []*ast.Field{}
+	if d.Type.Results != nil {
+		rawResults = d.Type.Results.List
+	}
+
+	// ── Escape analysis pre-pass ──────────────────────────────────────────────
+	var escapes EscapeSet
+	if d.Body != nil {
+		escapes = AnalyzeFunc(d.Body)
+
+		// Classify all &T{} declarations as ARC or Arena
+		for _, stmt := range d.Body.List {
+			assign, ok := stmt.(*ast.AssignStmt)
+			if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
+				continue
+			}
+			if unary, ok := assign.Rhs[0].(*ast.UnaryExpr); ok && unary.Op == token.AND {
+				if lit, ok := unary.X.(*ast.CompositeLit); ok {
+					varName := exprToString(assign.Lhs[0])
+					typeName := mapType(lit.Type)
+					if escapes[varName] {
+						syms.markArc(varName, typeName)
+					} else {
+						syms.markArena(varName, typeName)
+					}
+				}
+				continue
+			}
+			// x := someFunc() where someFunc returns Arc
+			if call, ok := assign.Rhs[0].(*ast.CallExpr); ok {
+				callee := exprToString(call.Fun)
+				if retTypeName, ok := funcReturnTypes[callee]; ok {
+					varName := exprToString(assign.Lhs[0])
+					syms.markArc(varName, retTypeName)
 				}
 			}
 		}
 	}
 
-	// Return types
+	// ── Resolve return type now that we have escape info ─────────────────────
 	retType := ""
-	if d.Type.Results != nil {
+	if len(rawResults) > 0 {
 		var rets []string
-		for _, r := range d.Type.Results.List {
-			rets = append(rets, mapType(r.Type))
+		for _, r := range rawResults {
+			if star, ok := r.Type.(*ast.StarExpr); ok {
+				innerType := mapType(star.X)
+				// If any Arc var of this type escapes, return Arc(T)
+				hasEscapingArc := false
+				for name, typName := range syms.arcVars {
+					if syms.isArc(name) && typName == innerType {
+						hasEscapingArc = true
+						break
+					}
+				}
+				if hasEscapingArc {
+					rets = append(rets, "golden.Arc("+innerType+")")
+				} else {
+					rets = append(rets, "^"+innerType)
+				}
+			} else {
+				rets = append(rets, mapType(r.Type))
+			}
 		}
 		if len(rets) == 1 {
 			retType = " -> " + rets[0]
@@ -164,10 +274,15 @@ func handleFunc(d *ast.FuncDecl) string {
 		}
 	}
 
-	sb.WriteString(fmt.Sprintf("%s :: proc(%s)%s {\n",
-		d.Name.Name, strings.Join(params, ", "), retType))
+	// ── Emit the proc ─────────────────────────────────────────────────────────
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("%s :: proc(%s)%s {\n", d.Name.Name, strings.Join(params, ", "), retType))
 
 	if d.Body != nil {
+		if syms.needsFrame {
+			sb.WriteString("\t_frame := golden.frame_begin()\n")
+			sb.WriteString("\tdefer golden.frame_end(&_frame)\n")
+		}
 		writeStmtsWithSyms(&sb, d.Body.List, 1, syms)
 	}
 
@@ -237,23 +352,31 @@ func translateStmtWithSyms(stmt ast.Stmt, depth int, syms *SymbolTable) []string
 
 	// ── Assignment — detect &T{} on RHS ─────────────────────────────────────
 	case *ast.AssignStmt:
-		// Check if RHS is &T{} — Arc allocation
 		if len(s.Lhs) == 1 && len(s.Rhs) == 1 {
 			if unary, ok := s.Rhs[0].(*ast.UnaryExpr); ok && unary.Op == token.AND {
 				if lit, ok := unary.X.(*ast.CompositeLit); ok {
 					varName := exprToString(s.Lhs[0])
-					typeName := mapType(lit.Type)
 					litStr := handleCompositeLit(lit)
-					// Register as Arc-managed
-					syms.markArc(varName, typeName)
-					return []string{
-						fmt.Sprintf("%s %s golden.make_arc(%s)", varName, s.Tok.String(), litStr),
-						fmt.Sprintf("defer golden.release(%s)", varName),
+					typeName := mapType(lit.Type)
+
+					switch syms.strategyOf(varName) {
+					case AllocArena:
+						// Local only — use arena bump allocator
+						// syms already marked by handleFunc pre-pass
+						return []string{
+							fmt.Sprintf("%s %s golden.frame_new(%s{}, &_frame)", varName, s.Tok.String(), typeName),
+							fmt.Sprintf("golden.frame_init(%s, %s)", varName, litStr),
+						}
+					default:
+						// Escapes scope — use ARC, no defer (caller owns it)
+						return []string{
+							fmt.Sprintf("%s %s golden.make_arc(%s)", varName, s.Tok.String(), litStr),
+						}
 					}
 				}
 			}
 		}
-		// Normal assignment — but unwrap Arc vars on RHS
+		// Normal assignment — unwrap Arc vars on RHS
 		var lhs, rhs []string
 		for _, l := range s.Lhs {
 			lhs = append(lhs, exprToString(l))
@@ -470,9 +593,12 @@ func exprToString(expr ast.Expr) string {
 	case *ast.Ident:
 		// Map Go built-ins
 		switch e.Name {
-		case "true":  return "true"
-		case "false": return "false"
-		case "nil":   return "nil"
+		case "true":
+			return "true"
+		case "false":
+			return "false"
+		case "nil":
+			return "nil"
 		}
 		return e.Name
 
@@ -481,9 +607,9 @@ func exprToString(expr ast.Expr) string {
 
 	// Binary expressions:  a + b,  a > b,  a == b …
 	case *ast.BinaryExpr:
-		left  := exprToString(e.X)
+		left := exprToString(e.X)
 		right := exprToString(e.Y)
-		op    := mapOperator(e.Op)
+		op := mapOperator(e.Op)
 		return fmt.Sprintf("%s %s %s", left, op, right)
 
 	// Unary:  -x,  !b,  &v
@@ -532,24 +658,42 @@ func exprToString(expr ast.Expr) string {
 
 func mapOperator(op token.Token) string {
 	switch op {
-	case token.ADD: return "+"
-	case token.SUB: return "-"
-	case token.MUL: return "*"
-	case token.QUO: return "/"
-	case token.REM: return "%%"
-	case token.EQL: return "=="
-	case token.NEQ: return "!="
-	case token.LSS: return "<"
-	case token.GTR: return ">"
-	case token.LEQ: return "<="
-	case token.GEQ: return ">="
-	case token.LAND: return "&&"
-	case token.LOR:  return "||"
-	case token.AND:  return "&"
-	case token.OR:   return "|"
-	case token.XOR:  return "~"
-	case token.SHL:  return "<<"
-	case token.SHR:  return ">>"
+	case token.ADD:
+		return "+"
+	case token.SUB:
+		return "-"
+	case token.MUL:
+		return "*"
+	case token.QUO:
+		return "/"
+	case token.REM:
+		return "%%"
+	case token.EQL:
+		return "=="
+	case token.NEQ:
+		return "!="
+	case token.LSS:
+		return "<"
+	case token.GTR:
+		return ">"
+	case token.LEQ:
+		return "<="
+	case token.GEQ:
+		return ">="
+	case token.LAND:
+		return "&&"
+	case token.LOR:
+		return "||"
+	case token.AND:
+		return "&"
+	case token.OR:
+		return "|"
+	case token.XOR:
+		return "~"
+	case token.SHL:
+		return "<<"
+	case token.SHR:
+		return ">>"
 	}
 	return op.String()
 }
@@ -557,18 +701,18 @@ func mapOperator(op token.Token) string {
 // ── Function Call Mapping ────────────────────────────────────────────────────
 
 var funcMap = map[string]string{
-	"fmt.Println":  "fmt.println",
-	"fmt.Printf":   "fmt.printf",
-	"fmt.Sprintf":  "fmt.tprintf",  // closest Odin equivalent
-	"fmt.Print":    "fmt.print",
-	"fmt.Fprintf":  "fmt.fprintln", // approximate
-	"len":          "len",
-	"cap":          "cap",
-	"make":         "make",
-	"append":       "append",
-	"delete":       "delete",
-	"panic":        "panic",
-	"new":          "new",
+	"fmt.Println": "fmt.println",
+	"fmt.Printf":  "fmt.printf",
+	"fmt.Sprintf": "fmt.tprintf", // closest Odin equivalent
+	"fmt.Print":   "fmt.print",
+	"fmt.Fprintf": "fmt.fprintln", // approximate
+	"len":         "len",
+	"cap":         "cap",
+	"make":        "make",
+	"append":      "append",
+	"delete":      "delete",
+	"panic":       "panic",
+	"new":         "new",
 }
 
 func handleCall(call *ast.CallExpr) string {
@@ -630,11 +774,19 @@ func exprToStringWithSyms(expr ast.Expr, syms *SymbolTable) string {
 	}
 	switch e := expr.(type) {
 
-	// u.Name → u.data.Name  (if u is Arc-managed)
+	// u.Name → u.data.Name  (ARC only — arena ptrs are plain ^T, no .data)
 	case *ast.SelectorExpr:
 		base := exprToString(e.X)
-		if ident, ok := e.X.(*ast.Ident); ok && syms.isArc(ident.Name) {
-			return fmt.Sprintf("%s.data.%s", base, e.Sel.Name)
+		if ident, ok := e.X.(*ast.Ident); ok {
+			switch syms.strategyOf(ident.Name) {
+			case AllocARC:
+				if syms.isArc(ident.Name) {
+					return fmt.Sprintf("%s.data.%s", base, e.Sel.Name)
+				}
+			case AllocArena:
+				// Arena ptr is ^T — direct field access, no .data wrapper
+				return fmt.Sprintf("%s.%s", base, e.Sel.Name)
+			}
 		}
 		return fmt.Sprintf("%s.%s", base, e.Sel.Name)
 
@@ -644,7 +796,9 @@ func exprToStringWithSyms(expr ast.Expr, syms *SymbolTable) string {
 	}
 }
 
-// handleCallWithSyms renders a function call, unwrapping Arc args correctly.
+// handleCallWithSyms renders a function call with Arc-aware argument passing.
+// Arc vars passed as arguments are passed directly (not unwrapped to .data)
+// since the callee expects Arc(T), not the inner field.
 func handleCallWithSyms(call *ast.CallExpr, syms *SymbolTable) string {
 	funcName := exprToString(call.Fun)
 	if mapped, ok := funcMap[funcName]; ok {
@@ -653,6 +807,19 @@ func handleCallWithSyms(call *ast.CallExpr, syms *SymbolTable) string {
 
 	var args []string
 	for _, arg := range call.Args {
+		if ident, ok := arg.(*ast.Ident); ok {
+			switch syms.strategyOf(ident.Name) {
+			case AllocARC:
+				// Arc var passed to ^T param — unwrap to .data
+				args = append(args, ident.Name+".data")
+			case AllocArena:
+				// Arena var is already ^T — pass directly
+				args = append(args, ident.Name)
+			default:
+				args = append(args, exprToStringWithSyms(arg, syms))
+			}
+			continue
+		}
 		args = append(args, exprToStringWithSyms(arg, syms))
 	}
 

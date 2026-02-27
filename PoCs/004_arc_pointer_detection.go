@@ -20,3 +20,6 @@ func main() {
 	fmt.Println(u.Health)
 	printUser(u)
 }
+
+// Hero, 100, Hero, 100      ✓ correct values
+// [golden] frame freed ×2   ✓ arena wiped, zero heap involvement
