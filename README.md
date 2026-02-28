@@ -32,14 +32,20 @@ golden/
 - [Odin](https://odin-lang.org/docs/install/) (to compile the generated output)
 
 ### Running the Transpiler
-To transpile a Go file to Odin, run:
+Golden can transpile a single Go file, or parse an entire package directory, merge the ASTs, and output a unified Odin executable.
 
 ```bash
+# Transpile a single file
 go run ./cmd/golden ./PoCs/006_goroutines.go ./out
+
+# OR Transpile an entire Go project directory
+go run ./cmd/golden ./PoCs/010_multifile ./out
+
+# Compile and run the deterministic, GC-free result
 cd out && odin run .
 ```
 
-## 🛠 Current Status
+## 🛠 Current Status (v1.0.0 MVP)
 
 ### Phase 1: Translator
 
@@ -69,8 +75,24 @@ cd out && odin run .
 
 [x] WaitGroups (sync.WaitGroup -> golden.WaitGroup)
 
-### Phase 4: Up Next
+### Phase 4: Language Semantics
 
-[ ] Channels (chan) and select
+[x] Slices ([]T mapped to [dynamic]T with auto-injected defer delete())
 
-[ ] Error Handling paradigms
+[x] Struct Methods (func (s *Struct)) decoupled into strict procedural calls
+
+[x] Multi-file project compilation (Package-level AST merging)
+
+[x] Idiomatic Error Handling (error interface mapped to nil-able C-Strings)
+
+[x] Channels (chan) mapping to Mutex/Cond rendezvous thread synchronization
+
+### Phase 5: The Road to V2.0
+
+[ ] Maps (map[K]V) with automatic memory management
+
+[ ] Interface (any / vtable) translation
+
+[ ] select statements for complex channel topologies
+
+[ ] Standard library bridging (os, io, net/http)
