@@ -6,6 +6,7 @@ import "core:fmt"
 import "core:mem"
 import "core:sync"
 import "core:thread"
+import "core:strings"
 
 // ═══════════════════════════════════════════════════════════════════
 // ARC — Automatic Reference Counting
@@ -264,4 +265,13 @@ chan_recv :: proc(c: ^Channel($T)) -> T {
     sync.cond_signal(&c.not_full)
     sync.mutex_unlock(&c.mu)
     return val
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// ERRORS
+// ═══════════════════════════════════════════════════════════════════
+
+// error_new converts an Odin string to a C-string so it can be nil-checked
+error_new :: proc(msg: string) -> cstring {
+    return strings.clone_to_cstring(msg)
 }

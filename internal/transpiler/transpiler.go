@@ -78,7 +78,7 @@ func mapType(expr ast.Expr) string {
 		case "rune":
 			return "rune"
 		case "error":
-			return "string"
+			return "cstring"
 		default:
 			return t.Name
 		}
@@ -326,6 +326,8 @@ func translateStmtWithSyms(stmt ast.Stmt, depth int, syms *SymbolTable) []string
 	switch s := stmt.(type) {
 	case *ast.AssignStmt:
 		if len(s.Lhs) == 1 && len(s.Rhs) == 1 {
+
+			// BLOCK 1: Pointer Initialization (&T{})
 			if unary, ok := s.Rhs[0].(*ast.UnaryExpr); ok && unary.Op == token.AND {
 				if lit, ok := unary.X.(*ast.CompositeLit); ok {
 					varName := exprToString(s.Lhs[0])
@@ -345,7 +347,39 @@ func translateStmtWithSyms(stmt ast.Stmt, depth int, syms *SymbolTable) []string
 					}
 				}
 			}
+
+			// BLOCK 2: Function Calls (make, append) - MUST NOT BE NESTED IN BLOCK 1!
+			if call, ok := s.Rhs[0].(*ast.CallExpr); ok {
+				funcName := exprToString(call.Fun)
+
+				// 1. Intercept 'x = append(x, y)' -> 'append(&x, y)'
+				if funcName == "append" {
+					sliceName := exprToString(call.Args[0])
+					var args []string
+					args = append(args, "&"+sliceName) // Pass pointer to Odin's append
+					for i := 1; i < len(call.Args); i++ {
+						args = append(args, exprToStringWithSyms(call.Args[i], syms))
+					}
+					return []string{fmt.Sprintf("append(%s)", strings.Join(args, ", "))}
+				}
+
+				// 2. Intercept 'x := make([]T)' -> Auto-inject 'defer delete(x)'
+				if funcName == "make" {
+					if _, isArray := call.Args[0].(*ast.ArrayType); isArray {
+						varName := exprToString(s.Lhs[0])
+						assignStr := fmt.Sprintf("%s %s %s", varName, s.Tok.String(), handleCallWithSyms(call, syms))
+
+						// Return the assignment AND the automatic memory cleanup!
+						return []string{
+							assignStr,
+							fmt.Sprintf("defer delete(%s)", varName),
+						}
+					}
+				}
+			}
 		}
+
+		// Standard Assignment Fallback
 		var lhs, rhs []string
 		for _, l := range s.Lhs {
 			lhs = append(lhs, exprToString(l))
@@ -573,6 +607,8 @@ func exprToString(expr ast.Expr) string {
 		return fmt.Sprintf("/* type assert */ %s", exprToString(e.X))
 	case *ast.SliceExpr:
 		return fmt.Sprintf("%s[%s:%s]", exprToString(e.X), exprToString(e.Low), exprToString(e.High))
+	case *ast.ArrayType:
+		return mapType(e)
 	}
 	return fmt.Sprintf("/* unknown expr %T */", expr)
 }
@@ -881,6 +917,7 @@ func init() {
 	funcMap["wg.Add"] = "golden.wg_add"
 	funcMap["wg.Done"] = "golden.wg_done"
 	funcMap["wg.Wait"] = "golden.wg_wait"
+	funcMap["errors.New"] = "golden.error_new"
 }
 
 func mapSyncType(name string) string {
