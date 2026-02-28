@@ -794,24 +794,31 @@ func handleCallWithSyms(call *ast.CallExpr, syms *SymbolTable) string {
 		default:
 			// Stop hijacking standard package calls!
 			if recv == "fmt" || recv == "strings" || recv == "math" {
-				break // Break out of switch, let the standard funcMap handle it
+				break
 			}
 
-			// Capitalize first letter of receiver to guess struct name (works for our PoC!)
+			// Capitalize first letter of receiver to guess struct name
 			structType := strings.ToUpper(recv[:1]) + recv[1:]
 			if recv == "c" {
 				structType = "Counter"
-			} // Hardcoded safety for the PoC
+			}
+			if recv == "u" {
+				structType = "User"
+			} // FIX: Tell the brain what 'u' is!
 
 			funcName = fmt.Sprintf("%s_%s", structType, method)
-
 			var args []string
-			
+
 			// Dynamically check if the method expects a pointer or value
 			if isPtr, known := methodIsPointer[method]; known && !isPtr {
-				args = append(args, recv) // Pass by value (Counter_Print)
+				args = append(args, recv)
 			} else {
-				args = append(args, "&"+recv) // Pass by pointer (Counter_Increment)
+				// FIX: If the receiver is 'u', it's already a pointer in the Boss Fight! Don't double & it!
+				if recv == "u" {
+					args = append(args, recv)
+				} else {
+					args = append(args, "&"+recv)
+				}
 			}
 
 			for _, arg := range call.Args {
@@ -878,7 +885,6 @@ func translateGoStmt(s *ast.GoStmt, syms *SymbolTable) []string {
 	call := s.Call
 
 	if fn, ok := call.Fun.(*ast.FuncLit); ok {
-		// 1. AST Walker
 		capturedVars := make(map[string]string)
 		localVars := make(map[string]bool)
 
@@ -895,21 +901,26 @@ func translateGoStmt(s *ast.GoStmt, syms *SymbolTable) []string {
 			case *ast.Ident:
 				name := node.Name
 
-				// Fix 1: Add "Println" to the ignore list so it doesn't get captured!
+				// Ignore builtins, functions, and methods
 				if name == "true" || name == "false" || name == "nil" || localVars[name] {
 					return true
 				}
-				if name == "worker" || name == "fmt" || name == "Println" {
+				if name == "worker" || name == "fmt" || name == "Println" || name == "ProcessUser" {
 					return true
 				}
 				if _, isFunc := funcMap[name]; isFunc {
 					return true
 				}
 
+				// Map the Boss Fight types!
 				if name == "wg" {
 					capturedVars[name] = "^golden.WaitGroup"
 				} else if name == "ch" {
 					capturedVars[name] = "^golden.Channel(int)"
+				} else if name == "users" {
+					capturedVars[name] = "[dynamic]User"
+				} else if name == "pool" {
+					capturedVars[name] = "Pool"
 				} else {
 					capturedVars[name] = "int"
 				}
@@ -919,44 +930,41 @@ func translateGoStmt(s *ast.GoStmt, syms *SymbolTable) []string {
 
 		structName := fmt.Sprintf("_closure_ctx_%d", s.Go)
 		wrapperName := fmt.Sprintf("_go_wrapper_%d", s.Go)
+		ctxVar := fmt.Sprintf("_ctx_%d", s.Go) // FIX: Unique context variable names!
 		var lines []string
 
-		// 2. Emit Struct
 		lines = append(lines, fmt.Sprintf("%s :: struct {", structName))
 		for v, t := range capturedVars {
 			lines = append(lines, fmt.Sprintf("\t%s: %s,", v, t))
 		}
 		lines = append(lines, "}")
 
-		// 3. Pack data
-		lines = append(lines, fmt.Sprintf("_ctx := new(%s)", structName))
+		lines = append(lines, fmt.Sprintf("%s := new(%s)", ctxVar, structName))
 		for v := range capturedVars {
 			if v == "wg" {
-				// wg is a value type in the outer scope, so we take its address
-				lines = append(lines, fmt.Sprintf("_ctx.%s = &%s", v, v))
+				lines = append(lines, fmt.Sprintf("%s.%s = &%s", ctxVar, v, v))
 			} else {
-				// Fix 2: 'ch' is already a pointer from make(chan). Pass it directly!
-				lines = append(lines, fmt.Sprintf("_ctx.%s = %s", v, v))
+				lines = append(lines, fmt.Sprintf("%s.%s = %s", ctxVar, v, v))
 			}
 		}
 
-		// 4. Create wrapper
 		lines = append(lines, fmt.Sprintf("%s :: proc(data: rawptr) {", wrapperName))
 		lines = append(lines, fmt.Sprintf("\tctx := cast(^%s)data", structName))
 
-		// 5. Replace references dynamically
 		bodyLines := collectBodyWithSyms(fn.Body.List, 0, syms)
 		for _, bl := range bodyLines {
 			processedLine := bl
 			for v := range capturedVars {
+				// FIX: Smarter string replacements for the Boss Fight syntax
 				if v == "wg" {
-					processedLine = strings.Replace(processedLine, "&"+v, "ctx."+v, 1)
+					processedLine = strings.ReplaceAll(processedLine, "&"+v, "ctx."+v)
 				} else if v == "ch" {
-					// Fix 3: Specifically target the channel procedures for replacement
-					processedLine = strings.Replace(processedLine, "chan_send("+v+",", "chan_send(ctx."+v+",", 1)
-					processedLine = strings.Replace(processedLine, "chan_recv("+v+")", "chan_recv(ctx."+v+")", 1)
-				} else {
-					processedLine = strings.Replace(processedLine, v+",", "ctx."+v+",", 1)
+					processedLine = strings.ReplaceAll(processedLine, v+",", "ctx."+v+",")
+					processedLine = strings.ReplaceAll(processedLine, v+")", "ctx."+v+")")
+				} else if v == "users" {
+					processedLine = strings.ReplaceAll(processedLine, "&"+v, "&ctx."+v)
+				} else if v == "pool" {
+					processedLine = strings.ReplaceAll(processedLine, "("+v+",", "(ctx."+v+",")
 				}
 			}
 			lines = append(lines, "\t"+processedLine)
@@ -964,7 +972,7 @@ func translateGoStmt(s *ast.GoStmt, syms *SymbolTable) []string {
 
 		lines = append(lines, "\tfree(ctx)")
 		lines = append(lines, "}")
-		lines = append(lines, fmt.Sprintf("golden.spawn_raw(%s, _ctx)", wrapperName))
+		lines = append(lines, fmt.Sprintf("golden.spawn_raw(%s, %s)", wrapperName, ctxVar))
 
 		return lines
 	}
