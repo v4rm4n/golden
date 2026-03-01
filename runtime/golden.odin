@@ -13,8 +13,8 @@ import "core:strings"
 // ═══════════════════════════════════════════════════════════════════
 
 Arc :: struct($T: typeid) {
-    data:  ^T,
-    count: ^int,
+    data:      ^T,
+    ref_count: ^int, // Renamed from 'count' to 'ref_count'
 }
 
 make_arc :: proc(value: $T) -> Arc(T) {
@@ -22,21 +22,33 @@ make_arc :: proc(value: $T) -> Arc(T) {
     d^ = value
     c := new(int)
     c^ = 1
-    return Arc(T){data = d, count = c}
+    return Arc(T){data = d, ref_count = c}
 }
 
 retain :: proc(a: Arc($T)) -> Arc(T) {
-    a.count^ += 1
+    if a.ref_count != nil {
+        a.ref_count^ += 1
+    }
     return a
 }
 
-release :: proc(a: Arc($T)) {
-    a.count^ -= 1
-    if a.count^ == 0 {
-        free(a.data)
-        free(a.count)
-        fmt.println("[golden] arc freed:", typeid_of(T))
+// This is what the transpiler calls!
+arc_release :: proc(arc: ^Arc($T)) {
+    if arc.ref_count == nil do return
+
+    arc.ref_count^ -= 1
+    if arc.ref_count^ == 0 {
+        if arc.data != nil do free(arc.data)
+        free(arc.ref_count)
+        arc.data = nil
+        arc.ref_count = nil
     }
+}
+
+// Keep 'release' as a helper if you want, but arc_release is the primary one
+release :: proc(a: Arc($T)) {
+    local_a := a
+    arc_release(&local_a)
 }
 
 // ═══════════════════════════════════════════════════════════════════

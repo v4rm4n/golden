@@ -20,6 +20,7 @@ func Process(f *ast.File) string {
 	methodIsPointer = make(map[string]bool)
 
 	res := NewResolver()
+	res.File = f
 	res.PopulateImports(f)
 
 	// PASS 1: The Census (Global Symbol Registration & Method Tracking)
@@ -53,9 +54,10 @@ func Process(f *ast.File) string {
 	var sb strings.Builder
 	sb.WriteString("package main\n\n")
 
-	if _, hasFmt := res.Imports["fmt"]; hasFmt {
-		sb.WriteString("import \"core:fmt\"\n")
-	}
+	// IMPORT CORE:MEM ALWAYS (since main uses it now)
+	sb.WriteString("import \"core:mem\"\n")
+	sb.WriteString("import \"core:fmt\"\n")
+
 	if _, hasOs := res.Imports["os"]; hasOs {
 		sb.WriteString("import \"core:os\"\n")
 		sb.WriteString("import golden_os \"golden/runtime\"\n")
@@ -304,6 +306,26 @@ func handleFuncWithResolver(d *ast.FuncDecl, res *Resolver) string {
 
 	if d.Body != nil {
 		if d.Name.Name == "main" {
+			// INJECT ODIN'S TRACKING ALLOCATOR
+			sb.WriteString("\ttrack: mem.Tracking_Allocator\n")
+			sb.WriteString("\tmem.tracking_allocator_init(&track, context.allocator)\n")
+			sb.WriteString("\tcontext.allocator = mem.tracking_allocator(&track)\n")
+			sb.WriteString("\tdefer mem.tracking_allocator_destroy(&track)\n")
+			sb.WriteString("\tdefer {\n")
+			sb.WriteString("\t\tif len(track.allocation_map) > 0 {\n")
+			sb.WriteString("\t\t\tfmt.eprintf(\"\\n=== MEMORY LEAK DETECTED: %v allocations not freed ===\\n\", len(track.allocation_map))\n")
+			sb.WriteString("\t\t\tfor _, entry in track.allocation_map {\n")
+			sb.WriteString("\t\t\t\tfmt.eprintf(\"- %v bytes @ %v\\n\", entry.size, entry.location)\n")
+			sb.WriteString("\t\t\t}\n")
+			sb.WriteString("\t\t}\n")
+			sb.WriteString("\t\tif len(track.bad_free_array) > 0 {\n")
+			sb.WriteString("\t\t\tfmt.eprintf(\"\\n=== BAD FREES DETECTED: %v incorrect frees ===\\n\", len(track.bad_free_array))\n")
+			sb.WriteString("\t\t\tfor entry in track.bad_free_array {\n")
+			sb.WriteString("\t\t\t\tfmt.eprintf(\"- %p @ %v\\n\", entry.memory, entry.location)\n")
+			sb.WriteString("\t\t\t}\n")
+			sb.WriteString("\t\t}\n")
+			sb.WriteString("\t}\n\n")
+
 			sb.WriteString("\tgolden.pool_start(8)\n\tdefer golden.pool_stop()\n")
 		}
 		if needsFrame {
@@ -358,12 +380,12 @@ func collectBodyWithResolver(stmts []ast.Stmt, depth int, res *Resolver) []strin
 
 func translateStmtWithResolver(stmt ast.Stmt, depth int, res *Resolver) []string {
 	switch s := stmt.(type) {
+
 	case *ast.AssignStmt:
-		// FIX 1: Explicitly register short-variable declarations (:=) so closures can capture them
+		// Explicitly register short-variable declarations (:=) so closures can capture them
 		if s.Tok == token.DEFINE {
 			for i, l := range s.Lhs {
 				if ident, ok := l.(*ast.Ident); ok {
-					// Check if already registered by Pass 1 (like Arena/ARC allocations)
 					if _, exists := res.Current.Symbols[ident.Name]; !exists {
 						goType := "int" // Default fallback
 						if i < len(s.Rhs) {
@@ -376,7 +398,7 @@ func translateStmtWithResolver(stmt ast.Stmt, depth int, res *Resolver) []string
 								}
 							} else if rhsId, ok := s.Rhs[i].(*ast.Ident); ok {
 								if sym, ok := res.Lookup(rhsId.Name); ok {
-									goType = sym.GoType // Copy type from shadowed variable
+									goType = sym.GoType
 								}
 							} else if call, ok := s.Rhs[i].(*ast.CallExpr); ok {
 								funcName := exprToStrBasic(call.Fun)
@@ -406,9 +428,15 @@ func translateStmtWithResolver(stmt ast.Stmt, depth int, res *Resolver) []string
 							fmt.Sprintf("golden.frame_init(%s, %s)", varName, litStr),
 						}
 					} else {
-						return []string{
-							fmt.Sprintf("%s %s golden.make_arc(%s)", varName, s.Tok.String(), litStr),
+						// ARC Logic
+						assignStr := fmt.Sprintf("%s %s golden.make_arc(%s)", varName, s.Tok.String(), litStr)
+						out := []string{assignStr}
+
+						// Get the parent function to check for returns
+						if !isReturningVar(varName, getParentFunc(s, res.File)) { // Pass the whole function body
+							out = append(out, fmt.Sprintf("defer golden.arc_release(&%s)", varName))
 						}
+						return out
 					}
 				}
 			}
@@ -425,22 +453,54 @@ func translateStmtWithResolver(stmt ast.Stmt, depth int, res *Resolver) []string
 					return []string{fmt.Sprintf("append(%s)", strings.Join(args, ", "))}
 				}
 				if funcName == "make" {
+					if chanType, isChan := call.Args[0].(*ast.ChanType); isChan {
+						res.Define(varName, &Symbol{
+							Name:     varName,
+							GoType:   "^golden.Channel(" + mapType(chanType.Value) + ")",
+							Strategy: AllocNone,
+						})
+						assignStr := fmt.Sprintf("%s %s golden.chan_make(%s)", varName, s.Tok.String(), mapType(chanType.Value))
+						return []string{assignStr, fmt.Sprintf("defer free(%s)", varName)}
+					}
 					if _, isArray := call.Args[0].(*ast.ArrayType); isArray {
 						assignStr := fmt.Sprintf("%s %s %s", varName, s.Tok.String(), handleCallWithResolver(call, res))
 						return []string{assignStr, fmt.Sprintf("defer delete(%s)", varName)}
 					}
 				}
+				// Handle normal function calls returning ARC pointers
+				if retTypeName, ok := funcReturnTypes[funcName]; ok {
+					res.Define(varName, &Symbol{Name: varName, GoType: retTypeName, Strategy: AllocARC})
+					assignStr := fmt.Sprintf("%s %s %s", varName, s.Tok.String(), handleCallWithResolver(call, res))
+					out := []string{assignStr}
+
+					// APPLY FIX HERE TOO:
+					if !isReturningVar(varName, getParentFunc(s, res.File)) {
+						out = append(out, fmt.Sprintf("defer golden.arc_release(&%s)", varName))
+					}
+					return out
+				}
 			}
 		}
 
 		var lhs, rhs []string
+		var defers []string // Array to hold our injected cleanups
+
 		for _, l := range s.Lhs {
-			lhs = append(lhs, exprToStr(l, res))
+			name := exprToStr(l, res)
+			lhs = append(lhs, name)
+			// FIX 3: If the variable looks like an error, auto-delete it at end of scope
+			// In Odin, `delete(nil)` is perfectly safe, so this works flawlessly.
+			if strings.Contains(name, "err") {
+				defers = append(defers, fmt.Sprintf("defer delete(%s)", name))
+			}
 		}
 		for _, r := range s.Rhs {
 			rhs = append(rhs, exprToStr(r, res))
 		}
-		return []string{fmt.Sprintf("%s %s %s", strings.Join(lhs, ", "), s.Tok.String(), strings.Join(rhs, ", "))}
+
+		out := []string{fmt.Sprintf("%s %s %s", strings.Join(lhs, ", "), s.Tok.String(), strings.Join(rhs, ", "))}
+		out = append(out, defers...) // Inject our cleanups right after the assignment
+		return out
 
 	case *ast.DeclStmt:
 		return translateDecl(s.Decl, res)
@@ -830,27 +890,43 @@ func handleCallWithResolver(call *ast.CallExpr, res *Resolver) string {
 				break
 			}
 
-			structType := strings.ToUpper(recvBase[:1]) + recvBase[1:]
-			if recvBase == "c" {
-				structType = "Counter"
-			}
-			if recvBase == "u" {
-				structType = "User"
+			structType := ""
+			var args []string
+			isPtr, known := methodIsPointer[method]
+
+			if sym, ok := res.Lookup(recvBase); ok {
+				// 1. Resolve Struct Name
+				structType = strings.TrimPrefix(sym.GoType, "golden.Arc(")
+				structType = strings.TrimSuffix(structType, ")")
+				structType = strings.TrimPrefix(structType, "^")
+
+				// 2. Resolve Receiver Argument
+				isAlreadyPtr := strings.HasPrefix(sym.GoType, "^")
+
+				if sym.Strategy == AllocARC {
+					if known && !isPtr {
+						args = append(args, recv+".data^") // Pass by value
+					} else {
+						args = append(args, recv+".data") // Pass the pointer
+					}
+				} else if isAlreadyPtr {
+					// If it's already a pointer, just pass it. No '&' needed.
+					args = append(args, recv)
+				} else {
+					// It's a value. Only add '&' if the method is known to want a pointer.
+					if known && !isPtr {
+						args = append(args, recv)
+					} else {
+						args = append(args, "&"+recv)
+					}
+				}
+			} else {
+				// Fallback for unknown symbols
+				structType = strings.ToUpper(recvBase[:1]) + recvBase[1:]
+				args = append(args, "&"+recv)
 			}
 
 			funcName := fmt.Sprintf("%s_%s", structType, method)
-			var args []string
-
-			if isPtr, known := methodIsPointer[method]; known && !isPtr {
-				args = append(args, recv)
-			} else {
-				if recvBase == "u" {
-					args = append(args, recv)
-				} else {
-					args = append(args, "&"+recv)
-				}
-			}
-
 			for _, arg := range call.Args {
 				args = append(args, exprToStr(arg, res))
 			}
@@ -932,17 +1008,14 @@ func translateGoStmtWithResolver(s *ast.GoStmt, res *Resolver) []string {
 					return true
 				}
 
-				// DYNAMIC CAPTURE: Look up the variable in the Resolver
 				if sym, ok := res.Lookup(name); ok && !sym.IsGlobal {
 					t := sym.GoType
 					isPtrRef := false
 
-					// Force pointer capture for sync structures
 					if t == "golden.WaitGroup" || t == "sync.Mutex" || t == "sync.RW_Mutex" {
 						t = "^" + t
 						isPtrRef = true
 					}
-
 					capturedVars[name] = CaptureInfo{Type: t, IsPtrRef: isPtrRef}
 				}
 			}
@@ -955,14 +1028,17 @@ func translateGoStmtWithResolver(s *ast.GoStmt, res *Resolver) []string {
 		var lines []string
 
 		lines = append(lines, fmt.Sprintf("%s :: struct {", structName))
+		// FIX 1A: Pack the allocator into the context struct
+		lines = append(lines, "\t_allocator: mem.Allocator,")
 		for v, info := range capturedVars {
 			lines = append(lines, fmt.Sprintf("\t%s: %s,", v, info.Type))
 		}
 		lines = append(lines, "}")
 
 		lines = append(lines, fmt.Sprintf("%s := new(%s)", ctxVar, structName))
+		// FIX 1B: Capture the main thread's allocator
+		lines = append(lines, fmt.Sprintf("%s._allocator = context.allocator", ctxVar))
 
-		// CORRECTED: Initialize the context struct with the captured variables
 		for v, info := range capturedVars {
 			if info.IsPtrRef {
 				lines = append(lines, fmt.Sprintf("%s.%s = &%s", ctxVar, v, v))
@@ -978,11 +1054,8 @@ func translateGoStmtWithResolver(s *ast.GoStmt, res *Resolver) []string {
 		for _, bl := range bodyLines {
 			processedLine := bl
 			for v, info := range capturedVars {
-				// Use RegEx to safely replace variables on word boundaries (e.g. "worker" but not "Worker_Process")
 				re := regexp.MustCompile(`\b` + regexp.QuoteMeta(v) + `\b`)
 				processedLine = re.ReplaceAllString(processedLine, "ctx."+v)
-
-				// Clean up pointer math if we forced a pointer capture
 				if info.IsPtrRef || strings.HasPrefix(info.Type, "^") {
 					processedLine = strings.ReplaceAll(processedLine, "&ctx."+v, "ctx."+v)
 				}
@@ -990,7 +1063,8 @@ func translateGoStmtWithResolver(s *ast.GoStmt, res *Resolver) []string {
 			lines = append(lines, "\t"+processedLine)
 		}
 
-		lines = append(lines, "\tfree(ctx)")
+		// FIX 1C: Tell the worker thread to free using the explicitly captured allocator
+		lines = append(lines, "\tfree(ctx, ctx._allocator)")
 		lines = append(lines, "}")
 		lines = append(lines, fmt.Sprintf("golden.spawn_raw(%s, %s)", wrapperName, ctxVar))
 
@@ -1026,4 +1100,37 @@ func toSnakeCase(str string) string {
 		b.WriteRune(r | 0x20)
 	}
 	return b.String()
+}
+
+func isReturningVar(name string, scopeStmt ast.Node) bool {
+	isReturned := false
+
+	// Walk the current function or block to see if 'name' is used in a ReturnStmt
+	ast.Inspect(scopeStmt, func(n ast.Node) bool {
+		if ret, ok := n.(*ast.ReturnStmt); ok {
+			for _, res := range ret.Results {
+				if ident, ok := res.(*ast.Ident); ok && ident.Name == name {
+					isReturned = true
+					return false // Found it, stop looking
+				}
+			}
+		}
+		return true
+	})
+
+	return isReturned
+}
+
+func getParentFunc(n ast.Node, file *ast.File) ast.Node {
+	var parent ast.Node
+	ast.Inspect(file, func(child ast.Node) bool {
+		if fd, ok := child.(*ast.FuncDecl); ok {
+			// Check if n is inside fd
+			if n.Pos() >= fd.Pos() && n.End() <= fd.End() {
+				parent = fd
+			}
+		}
+		return true
+	})
+	return parent
 }

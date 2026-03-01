@@ -31,6 +31,7 @@ type Scope struct {
 }
 
 type Resolver struct {
+	File        *ast.File
 	PackageName string
 	Imports     map[string]string // Key: Alias/Name (os), Value: Path ("os")
 	GlobalScope *Scope
