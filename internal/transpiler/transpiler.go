@@ -6,42 +6,63 @@ import (
 	"fmt"
 	"go/ast"
 	"go/token"
+	"regexp"
 	"strings"
 )
 
-// ── Top-level processor ──────────────────────────────────────────────────────
-
 var funcReturnTypes = map[string]string{}
 var methodIsPointer = map[string]bool{}
+
+// ── Top-level processor ──────────────────────────────────────────────────────
 
 func Process(f *ast.File) string {
 	funcReturnTypes = make(map[string]string)
 	methodIsPointer = make(map[string]bool)
 
+	res := NewResolver()
+	res.PopulateImports(f)
+
+	// PASS 1: The Census (Global Symbol Registration & Method Tracking)
 	for _, decl := range f.Decls {
-		fd, ok := decl.(*ast.FuncDecl)
-		if !ok {
-			continue
-		}
+		if fd, ok := decl.(*ast.FuncDecl); ok {
+			// Track if methods use pointer receivers
+			if fd.Recv != nil && len(fd.Recv.List) > 0 {
+				_, isPtr := fd.Recv.List[0].Type.(*ast.StarExpr)
+				methodIsPointer[fd.Name.Name] = isPtr
+			}
+			// Track return types for ARC routing
+			if fd.Type.Results != nil && len(fd.Type.Results.List) > 0 {
+				first := fd.Type.Results.List[0].Type
+				if star, ok := first.(*ast.StarExpr); ok {
+					funcReturnTypes[fd.Name.Name] = mapType(star.X)
+				}
+			}
+			// Register Function in Resolver
+			res.Define(fd.Name.Name, &Symbol{Name: fd.Name.Name, GoType: "proc", IsGlobal: true})
 
-		// Track if methods use pointer receivers!
-		if fd.Recv != nil && len(fd.Recv.List) > 0 {
-			_, isPtr := fd.Recv.List[0].Type.(*ast.StarExpr)
-			methodIsPointer[fd.Name.Name] = isPtr
-		}
-
-		if fd.Type.Results == nil || len(fd.Type.Results.List) == 0 {
-			continue
-		}
-		first := fd.Type.Results.List[0].Type
-		if star, ok := first.(*ast.StarExpr); ok {
-			funcReturnTypes[fd.Name.Name] = mapType(star.X)
+		} else if gd, ok := decl.(*ast.GenDecl); ok {
+			for _, spec := range gd.Specs {
+				if ts, ok := spec.(*ast.TypeSpec); ok {
+					res.Define(ts.Name.Name, &Symbol{Name: ts.Name.Name, GoType: "struct", IsGlobal: true})
+				}
+			}
 		}
 	}
 
+	// PASS 2: The Alchemy (Translation)
 	var sb strings.Builder
 	sb.WriteString("package main\n\n")
-	sb.WriteString("import \"core:fmt\"\n")
+
+	if _, hasFmt := res.Imports["fmt"]; hasFmt {
+		sb.WriteString("import \"core:fmt\"\n")
+	}
+	if _, hasOs := res.Imports["os"]; hasOs {
+		sb.WriteString("import \"core:os\"\n")
+		sb.WriteString("import golden_os \"golden/runtime\"\n")
+	}
+	if _, hasSync := res.Imports["sync"]; hasSync {
+		sb.WriteString("import \"core:sync\"\n")
+	}
 	sb.WriteString("import golden \"golden\"\n\n")
 
 	for _, decl := range f.Decls {
@@ -50,7 +71,7 @@ func Process(f *ast.File) string {
 		case *ast.GenDecl:
 			output = handleStruct(d)
 		case *ast.FuncDecl:
-			output = handleFunc(d)
+			output = handleFuncWithResolver(d, res)
 		}
 		if output != "" {
 			sb.WriteString(output)
@@ -98,11 +119,11 @@ func mapType(expr ast.Expr) string {
 		if t.Len == nil {
 			return fmt.Sprintf("[dynamic]%s", mapType(t.Elt))
 		}
-		return fmt.Sprintf("[%s]%s", exprToString(t.Len), mapType(t.Elt))
+		return fmt.Sprintf("[%s]%s", exprToStrBasic(t.Len), mapType(t.Elt))
 	case *ast.MapType:
 		return fmt.Sprintf("map[%s]%s", mapType(t.Key), mapType(t.Value))
 	case *ast.SelectorExpr:
-		pkg := exprToString(t.X)
+		pkg := exprToStrBasic(t.X)
 		name := t.Sel.Name
 		if pkg == "sync" {
 			return mapSyncType(name)
@@ -113,8 +134,6 @@ func mapType(expr ast.Expr) string {
 	}
 	return "rawptr"
 }
-
-// ── Struct Handler ───────────────────────────────────────────────────────────
 
 func handleStruct(d *ast.GenDecl) string {
 	var sb strings.Builder
@@ -140,139 +159,130 @@ func handleStruct(d *ast.GenDecl) string {
 	return sb.String()
 }
 
-// ── Symbol Table ─────────────────────────────────────────────────────────────
-
-type AllocStrategy int
-
-const (
-	AllocNone AllocStrategy = iota
-	AllocARC
-	AllocArena
-)
-
-type SymbolTable struct {
-	arcVars    map[string]string
-	strategy   map[string]AllocStrategy
-	needsFrame bool
-}
-
-func newSymbolTable() *SymbolTable {
-	return &SymbolTable{
-		arcVars:  make(map[string]string),
-		strategy: make(map[string]AllocStrategy),
-	}
-}
-
-func (s *SymbolTable) markArc(name, typeName string) {
-	s.arcVars[name] = typeName
-	s.strategy[name] = AllocARC
-}
-
-func (s *SymbolTable) markArena(name, typeName string) {
-	s.arcVars[name] = typeName
-	s.strategy[name] = AllocArena
-	s.needsFrame = true
-}
-
-func (s *SymbolTable) isArc(name string) bool {
-	st, ok := s.strategy[name]
-	return ok && st == AllocARC
-}
-
-func (s *SymbolTable) strategyOf(name string) AllocStrategy {
-	if st, ok := s.strategy[name]; ok {
-		return st
-	}
-	return AllocNone
-}
-
 // ── Function Handler ─────────────────────────────────────────────────────────
 
-func handleFunc(d *ast.FuncDecl) string {
-	syms := newSymbolTable()
+func handleFuncWithResolver(d *ast.FuncDecl, res *Resolver) string {
+	res.EnterScope()
+	defer res.ExitScope()
+
 	var params []string
-
 	funcName := d.Name.Name
+	needsFrame := false
 
-	// Handle Receiver (Method -> Proc translation)
+	// Handle Receiver
 	if d.Recv != nil && len(d.Recv.List) > 0 {
 		recv := d.Recv.List[0]
 		recvType := mapType(recv.Type)
-		recvName := "self" // fallback
+		recvName := "self"
 		if len(recv.Names) > 0 {
 			recvName = recv.Names[0].Name
 		}
-
-		// Determine the struct name to prefix the procedure
-		structName := recvType
-		if strings.HasPrefix(structName, "^") {
-			structName = strings.TrimPrefix(structName, "^")
-		}
-
+		structName := strings.TrimPrefix(recvType, "^")
 		funcName = fmt.Sprintf("%s_%s", structName, d.Name.Name)
 		params = append(params, fmt.Sprintf("%s: %s", recvName, recvType))
+		res.Define(recvName, &Symbol{Name: recvName, GoType: recvType, Strategy: AllocNone})
 	}
 
+	// Handle Parameters
 	if d.Type.Params != nil {
 		for _, field := range d.Type.Params.List {
 			pType := mapType(field.Type)
 			for _, pName := range field.Names {
+				strategy := AllocNone
 				if _, ok := field.Type.(*ast.StarExpr); ok {
-					syms.markArena(pName.Name, pType)
+					strategy = AllocArena
+					needsFrame = true
 				}
 				params = append(params, fmt.Sprintf("%s: %s", pName.Name, pType))
+				res.Define(pName.Name, &Symbol{Name: pName.Name, GoType: pType, Strategy: strategy})
 			}
 		}
 	}
 
-	rawResults := []*ast.Field{}
-	if d.Type.Results != nil {
-		rawResults = d.Type.Results.List
-	}
-
-	var escapes EscapeSet
 	if d.Body != nil {
-		escapes = AnalyzeFunc(d.Body)
+		escapes := AnalyzeFunc(d.Body)
 		for _, stmt := range d.Body.List {
-			assign, ok := stmt.(*ast.AssignStmt)
-			if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
-				continue
-			}
-			if unary, ok := assign.Rhs[0].(*ast.UnaryExpr); ok && unary.Op == token.AND {
-				if lit, ok := unary.X.(*ast.CompositeLit); ok {
-					varName := exprToString(assign.Lhs[0])
-					typeName := mapType(lit.Type)
-					if escapes[varName] {
-						syms.markArc(varName, typeName)
-					} else {
-						syms.markArena(varName, typeName)
+			// ... (existing logic for other statements) ...
+
+			if assign, ok := stmt.(*ast.AssignStmt); ok {
+				if len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
+					continue
+				}
+				varName := exprToStrBasic(assign.Lhs[0])
+
+				// A. Handle &Struct{} allocations
+				if unary, ok := assign.Rhs[0].(*ast.UnaryExpr); ok && unary.Op == token.AND {
+					if lit, ok := unary.X.(*ast.CompositeLit); ok {
+						strat := AllocArena
+						if escapes[varName] {
+							strat = AllocARC
+						}
+						if strat == AllocArena {
+							needsFrame = true
+						}
+						res.Define(varName, &Symbol{Name: varName, GoType: mapType(lit.Type), Strategy: strat})
+					}
+					continue
+				}
+
+				// B. Handle make() calls (like channels and slices)
+				if call, ok := assign.Rhs[0].(*ast.CallExpr); ok {
+					funcName := exprToStrBasic(call.Fun)
+					if funcName == "make" && len(call.Args) > 0 {
+						if chanType, isChan := call.Args[0].(*ast.ChanType); isChan {
+							// Register the channel in the resolver!
+							res.Define(varName, &Symbol{
+								Name:     varName,
+								GoType:   "^golden.Channel(" + mapType(chanType.Value) + ")",
+								Strategy: AllocNone,
+							})
+							continue
+						}
+						if arrayType, isArray := call.Args[0].(*ast.ArrayType); isArray {
+							res.Define(varName, &Symbol{
+								Name:     varName,
+								GoType:   "[dynamic]" + mapType(arrayType.Elt),
+								Strategy: AllocNone,
+							})
+							continue
+						}
+					}
+					// Handle normal function calls (check return type map)
+					if retTypeName, ok := funcReturnTypes[funcName]; ok {
+						res.Define(varName, &Symbol{Name: varName, GoType: retTypeName, Strategy: AllocARC})
+						continue
 					}
 				}
-				continue
-			}
-			if call, ok := assign.Rhs[0].(*ast.CallExpr); ok {
-				callee := exprToString(call.Fun)
-				if retTypeName, ok := funcReturnTypes[callee]; ok {
-					varName := exprToString(assign.Lhs[0])
-					syms.markArc(varName, retTypeName)
+
+				// C. Handle standard Struct{} initialization (worker := Worker{})
+				if lit, ok := assign.Rhs[0].(*ast.CompositeLit); ok {
+					res.Define(varName, &Symbol{
+						Name:     varName,
+						GoType:   mapType(lit.Type),
+						Strategy: AllocNone,
+					})
+					continue
 				}
 			}
 		}
 	}
 
 	retType := ""
-	if len(rawResults) > 0 {
+	if d.Type.Results != nil && len(d.Type.Results.List) > 0 {
 		var rets []string
-		for _, r := range rawResults {
+		for _, r := range d.Type.Results.List {
 			if star, ok := r.Type.(*ast.StarExpr); ok {
 				innerType := mapType(star.X)
+
+				// Scan current scope to see if we mapped an escaping var to ARC
 				hasEscapingArc := false
-				for name, typName := range syms.arcVars {
-					if syms.isArc(name) && typName == innerType {
+				for _, sym := range res.Current.Symbols {
+					if sym.Strategy == AllocARC && sym.GoType == innerType {
 						hasEscapingArc = true
 						break
 					}
 				}
+
 				if hasEscapingArc {
 					rets = append(rets, "golden.Arc("+innerType+")")
 				} else {
@@ -294,14 +304,12 @@ func handleFunc(d *ast.FuncDecl) string {
 
 	if d.Body != nil {
 		if d.Name.Name == "main" {
-			sb.WriteString("\tgolden.pool_start(8)\n")
-			sb.WriteString("\tdefer golden.pool_stop()\n")
+			sb.WriteString("\tgolden.pool_start(8)\n\tdefer golden.pool_stop()\n")
 		}
-		if syms.needsFrame {
-			sb.WriteString("\t_frame := golden.frame_begin()\n")
-			sb.WriteString("\tdefer golden.frame_end(&_frame)\n")
+		if needsFrame {
+			sb.WriteString("\t_frame := golden.frame_begin()\n\tdefer golden.frame_end(&_frame)\n")
 		}
-		writeStmtsWithSyms(&sb, d.Body.List, 1, syms)
+		writeStmtsWithResolver(&sb, d.Body.List, 1, res)
 	}
 
 	sb.WriteString("}")
@@ -310,13 +318,15 @@ func handleFunc(d *ast.FuncDecl) string {
 
 // ── Statement Writer ─────────────────────────────────────────
 
-func writeStmts(sb *strings.Builder, stmts []ast.Stmt, depth int) {
-	writeStmtsWithSyms(sb, stmts, depth, newSymbolTable())
-}
-
-func writeStmtsWithSyms(sb *strings.Builder, stmts []ast.Stmt, depth int, syms *SymbolTable) {
+func writeStmtsWithResolver(sb *strings.Builder, stmts []ast.Stmt, depth int, res *Resolver) {
 	for _, stmt := range stmts {
-		lines := translateStmtWithSyms(stmt, depth, syms)
+		if block, ok := stmt.(*ast.BlockStmt); ok {
+			res.EnterScope()
+			writeStmtsWithResolver(sb, block.List, depth, res)
+			res.ExitScope()
+			continue
+		}
+		lines := translateStmtWithResolver(stmt, depth, res)
 		writeLines(sb, lines, depth)
 	}
 }
@@ -331,13 +341,9 @@ func writeLines(sb *strings.Builder, lines []string, depth int) {
 	}
 }
 
-func collectBody(stmts []ast.Stmt, depth int) []string {
-	return collectBodyWithSyms(stmts, depth, newSymbolTable())
-}
-
-func collectBodyWithSyms(stmts []ast.Stmt, depth int, syms *SymbolTable) []string {
+func collectBodyWithResolver(stmts []ast.Stmt, depth int, res *Resolver) []string {
 	var sb strings.Builder
-	writeStmtsWithSyms(&sb, stmts, depth+1, syms)
+	writeStmtsWithResolver(&sb, stmts, depth+1, res)
 	raw := strings.TrimRight(sb.String(), "\n")
 	if raw == "" {
 		return nil
@@ -350,29 +356,56 @@ func collectBodyWithSyms(stmts []ast.Stmt, depth int, syms *SymbolTable) []strin
 	return lines
 }
 
-func translateStmt(stmt ast.Stmt, depth int) []string {
-	return translateStmtWithSyms(stmt, depth, newSymbolTable())
-}
-
-func translateStmtWithSyms(stmt ast.Stmt, depth int, syms *SymbolTable) []string {
+func translateStmtWithResolver(stmt ast.Stmt, depth int, res *Resolver) []string {
 	switch s := stmt.(type) {
 	case *ast.AssignStmt:
-		if len(s.Lhs) == 1 && len(s.Rhs) == 1 {
+		// FIX 1: Explicitly register short-variable declarations (:=) so closures can capture them
+		if s.Tok == token.DEFINE {
+			for i, l := range s.Lhs {
+				if ident, ok := l.(*ast.Ident); ok {
+					// Check if already registered by Pass 1 (like Arena/ARC allocations)
+					if _, exists := res.Current.Symbols[ident.Name]; !exists {
+						goType := "int" // Default fallback
+						if i < len(s.Rhs) {
+							if lit, ok := s.Rhs[i].(*ast.BasicLit); ok {
+								if lit.Kind == token.STRING {
+									goType = "string"
+								}
+								if lit.Kind == token.FLOAT {
+									goType = "f64"
+								}
+							} else if rhsId, ok := s.Rhs[i].(*ast.Ident); ok {
+								if sym, ok := res.Lookup(rhsId.Name); ok {
+									goType = sym.GoType // Copy type from shadowed variable
+								}
+							} else if call, ok := s.Rhs[i].(*ast.CallExpr); ok {
+								funcName := exprToStrBasic(call.Fun)
+								if retType, ok := funcReturnTypes[funcName]; ok {
+									goType = retType
+								}
+							}
+						}
+						res.Define(ident.Name, &Symbol{Name: ident.Name, GoType: goType})
+					}
+				}
+			}
+		}
 
-			// BLOCK 1: Pointer Initialization (&T{})
+		if len(s.Lhs) == 1 && len(s.Rhs) == 1 {
+			varName := exprToStr(s.Lhs[0], res)
+			sym, exists := res.Lookup(varName)
+
 			if unary, ok := s.Rhs[0].(*ast.UnaryExpr); ok && unary.Op == token.AND {
 				if lit, ok := unary.X.(*ast.CompositeLit); ok {
-					varName := exprToString(s.Lhs[0])
-					litStr := handleCompositeLit(lit)
+					litStr := handleCompositeLit(lit, res)
 					typeName := mapType(lit.Type)
 
-					switch syms.strategyOf(varName) {
-					case AllocArena:
+					if exists && sym.Strategy == AllocArena {
 						return []string{
 							fmt.Sprintf("%s %s golden.frame_new(%s{}, &_frame)", varName, s.Tok.String(), typeName),
 							fmt.Sprintf("golden.frame_init(%s, %s)", varName, litStr),
 						}
-					default:
+					} else {
 						return []string{
 							fmt.Sprintf("%s %s golden.make_arc(%s)", varName, s.Tok.String(), litStr),
 						}
@@ -380,131 +413,128 @@ func translateStmtWithSyms(stmt ast.Stmt, depth int, syms *SymbolTable) []string
 				}
 			}
 
-			// BLOCK 2: Function Calls (make, append) - MUST NOT BE NESTED IN BLOCK 1!
 			if call, ok := s.Rhs[0].(*ast.CallExpr); ok {
-				funcName := exprToString(call.Fun)
-
-				// 1. Intercept 'x = append(x, y)' -> 'append(&x, y)'
+				funcName := exprToStrBasic(call.Fun)
 				if funcName == "append" {
-					sliceName := exprToString(call.Args[0])
+					sliceName := exprToStr(call.Args[0], res)
 					var args []string
-					args = append(args, "&"+sliceName) // Pass pointer to Odin's append
+					args = append(args, "&"+sliceName)
 					for i := 1; i < len(call.Args); i++ {
-						args = append(args, exprToStringWithSyms(call.Args[i], syms))
+						args = append(args, exprToStr(call.Args[i], res))
 					}
 					return []string{fmt.Sprintf("append(%s)", strings.Join(args, ", "))}
 				}
-
-				// 2. Intercept 'x := make([]T)' -> Auto-inject 'defer delete(x)'
 				if funcName == "make" {
 					if _, isArray := call.Args[0].(*ast.ArrayType); isArray {
-						varName := exprToString(s.Lhs[0])
-						assignStr := fmt.Sprintf("%s %s %s", varName, s.Tok.String(), handleCallWithSyms(call, syms))
-
-						// Return the assignment AND the automatic memory cleanup!
-						return []string{
-							assignStr,
-							fmt.Sprintf("defer delete(%s)", varName),
-						}
+						assignStr := fmt.Sprintf("%s %s %s", varName, s.Tok.String(), handleCallWithResolver(call, res))
+						return []string{assignStr, fmt.Sprintf("defer delete(%s)", varName)}
 					}
 				}
 			}
 		}
 
-		// Standard Assignment Fallback
 		var lhs, rhs []string
 		for _, l := range s.Lhs {
-			lhs = append(lhs, exprToString(l))
+			lhs = append(lhs, exprToStr(l, res))
 		}
 		for _, r := range s.Rhs {
-			rhs = append(rhs, exprToStringWithSyms(r, syms))
+			rhs = append(rhs, exprToStr(r, res))
 		}
 		return []string{fmt.Sprintf("%s %s %s", strings.Join(lhs, ", "), s.Tok.String(), strings.Join(rhs, ", "))}
 
 	case *ast.DeclStmt:
-		return translateDecl(s.Decl)
+		return translateDecl(s.Decl, res)
 	case *ast.ExprStmt:
 		if call, ok := s.X.(*ast.CallExpr); ok {
-			return []string{handleCallWithSyms(call, syms)}
+			return []string{handleCallWithResolver(call, res)}
 		}
-		return []string{exprToStringWithSyms(s.X, syms)}
+		return []string{exprToStr(s.X, res)}
 	case *ast.ReturnStmt:
 		if len(s.Results) == 0 {
 			return []string{"return"}
 		}
 		var parts []string
 		for _, r := range s.Results {
-			parts = append(parts, exprToStringWithSyms(r, syms))
+			parts = append(parts, exprToStr(r, res))
 		}
 		return []string{"return " + strings.Join(parts, ", ")}
 	case *ast.IfStmt:
-		return translateIfWithSyms(s, depth, syms)
+		return translateIfWithResolver(s, depth, res)
 	case *ast.ForStmt:
-		return translateFor(s, depth)
+		return translateForWithResolver(s, depth, res)
 	case *ast.RangeStmt:
-		return translateRange(s, depth)
+		return translateRangeWithResolver(s, depth, res)
 	case *ast.DeferStmt:
-		return []string{"defer " + handleCallWithSyms(s.Call, syms)}
+		return []string{"defer " + handleCallWithResolver(s.Call, res)}
 	case *ast.IncDecStmt:
 		op := "+="
 		if s.Tok == token.DEC {
 			op = "-="
 		}
-		return []string{fmt.Sprintf("%s %s 1", exprToString(s.X), op)}
+		return []string{fmt.Sprintf("%s %s 1", exprToStr(s.X, res), op)}
 	case *ast.BlockStmt:
 		var lines []string
 		lines = append(lines, "{")
+		res.EnterScope()
 		var inner strings.Builder
-		writeStmtsWithSyms(&inner, s.List, depth+1, syms)
+		writeStmtsWithResolver(&inner, s.List, depth+1, res)
+		res.ExitScope()
 		lines = append(lines, inner.String())
 		lines = append(lines, "}")
 		return lines
 	case *ast.GoStmt:
-		return translateGoStmt(s, syms)
+		return translateGoStmtWithResolver(s, res)
 	case *ast.SendStmt:
-		ch := exprToStringWithSyms(s.Chan, syms)
-		val := exprToStringWithSyms(s.Value, syms)
+		ch := exprToStr(s.Chan, res)
+		val := exprToStr(s.Value, res)
 		return []string{fmt.Sprintf("golden.chan_send(%s, %s)", ch, val)}
 	}
 	return []string{"// TODO: unsupported statement"}
 }
 
-func translateIf(s *ast.IfStmt, depth int) []string {
+func translateIfWithResolver(s *ast.IfStmt, depth int, res *Resolver) []string {
 	var lines []string
-	cond := exprToString(s.Cond)
-	lines = append(lines, fmt.Sprintf("if %s {", cond))
 	inner := strings.Repeat("\t", 1)
-	for _, l := range collectBody(s.Body.List, depth) {
+	cond := exprToStr(s.Cond, res)
+	lines = append(lines, fmt.Sprintf("if %s {", cond))
+
+	res.EnterScope()
+	for _, l := range collectBodyWithResolver(s.Body.List, depth, res) {
 		lines = append(lines, inner+l)
 	}
+	res.ExitScope()
+
 	if s.Else == nil {
 		lines = append(lines, "}")
 		return lines
 	}
 	switch el := s.Else.(type) {
 	case *ast.IfStmt:
-		elseLines := translateIf(el, depth)
+		elseLines := translateIfWithResolver(el, depth, res)
 		lines = append(lines, "} else "+elseLines[0])
 		lines = append(lines, elseLines[1:]...)
 	case *ast.BlockStmt:
 		lines = append(lines, "} else {")
-		for _, l := range collectBody(el.List, depth) {
+		res.EnterScope()
+		for _, l := range collectBodyWithResolver(el.List, depth, res) {
 			lines = append(lines, inner+l)
 		}
+		res.ExitScope()
 		lines = append(lines, "}")
 	}
 	return lines
 }
 
-// ── FIX 1: For Loop Scope Isolation ──────────────────────────────────────────
-
-func translateFor(s *ast.ForStmt, depth int) []string {
+func translateForWithResolver(s *ast.ForStmt, depth int, res *Resolver) []string {
 	var lines []string
 	inner := strings.Repeat("\t", 1)
 
+	res.EnterScope()
+	defer res.ExitScope()
+
 	if s.Init == nil && s.Cond == nil && s.Post == nil {
 		lines = append(lines, "for {")
-		for _, l := range collectBody(s.Body.List, depth) {
+		for _, l := range collectBodyWithResolver(s.Body.List, depth, res) {
 			lines = append(lines, inner+l)
 		}
 		lines = append(lines, "}")
@@ -512,29 +542,26 @@ func translateFor(s *ast.ForStmt, depth int) []string {
 	}
 
 	if s.Init == nil && s.Post == nil {
-		lines = append(lines, fmt.Sprintf("for %s {", exprToString(s.Cond)))
-		for _, l := range collectBody(s.Body.List, depth) {
+		lines = append(lines, fmt.Sprintf("for %s {", exprToStr(s.Cond, res)))
+		for _, l := range collectBodyWithResolver(s.Body.List, depth, res) {
 			lines = append(lines, inner+l)
 		}
 		lines = append(lines, "}")
 		return lines
 	}
 
-	initLines := translateStmt(s.Init, depth)
-	postLines := translateStmt(s.Post, depth)
+	initLines := translateStmtWithResolver(s.Init, depth, res)
+	postLines := translateStmtWithResolver(s.Post, depth, res)
 
 	lines = append(lines, initLines...)
-	lines = append(lines, fmt.Sprintf("for %s {", exprToString(s.Cond)))
+	lines = append(lines, fmt.Sprintf("for %s {", exprToStr(s.Cond, res)))
 
-	// FIX: Wrap the body in an extra block to protect shadowed variables
-	// from leaking into the post statement (like i += 1)
 	lines = append(lines, inner+"{")
-	for _, l := range collectBody(s.Body.List, depth+1) {
+	for _, l := range collectBodyWithResolver(s.Body.List, depth+1, res) {
 		lines = append(lines, inner+"\t"+l)
 	}
 	lines = append(lines, inner+"}")
 
-	// Now the post statement executes against the outer loop variable!
 	for _, pl := range postLines {
 		lines = append(lines, inner+pl)
 	}
@@ -542,27 +569,29 @@ func translateFor(s *ast.ForStmt, depth int) []string {
 	return lines
 }
 
-func translateRange(s *ast.RangeStmt, depth int) []string {
+func translateRangeWithResolver(s *ast.RangeStmt, depth int, res *Resolver) []string {
 	var lines []string
 	inner := strings.Repeat("\t", 1)
-	collection := exprToString(s.X)
+	collection := exprToStr(s.X, res)
 	key, val := "_", "_"
 	if s.Key != nil {
-		key = exprToString(s.Key)
+		key = exprToStr(s.Key, res)
 	}
 	if s.Value != nil {
-		val = exprToString(s.Value)
+		val = exprToStr(s.Value, res)
 	}
 
 	lines = append(lines, fmt.Sprintf("for %s, %s in %s {", val, key, collection))
-	for _, l := range collectBody(s.Body.List, depth) {
+	res.EnterScope()
+	for _, l := range collectBodyWithResolver(s.Body.List, depth, res) {
 		lines = append(lines, inner+l)
 	}
+	res.ExitScope()
 	lines = append(lines, "}")
 	return lines
 }
 
-func translateDecl(decl ast.Decl) []string {
+func translateDecl(decl ast.Decl, res *Resolver) []string {
 	gd, ok := decl.(*ast.GenDecl)
 	if !ok {
 		return nil
@@ -573,31 +602,52 @@ func translateDecl(decl ast.Decl) []string {
 		if !ok {
 			continue
 		}
+
 		typeName := ""
+		mappedType := "" // We need to store this for the Resolver!
 		isSyncWG := false
+
 		if vs.Type != nil {
-			typeName = ": " + mapType(vs.Type)
+			mappedType = mapType(vs.Type)
+			typeName = ": " + mappedType
 			if sel, ok := vs.Type.(*ast.SelectorExpr); ok {
-				if exprToString(sel.X) == "sync" && sel.Sel.Name == "WaitGroup" {
+				if exprToStrBasic(sel.X) == "sync" && sel.Sel.Name == "WaitGroup" {
 					isSyncWG = true
 				}
 			}
 		}
+
 		for i, name := range vs.Names {
 			if i < len(vs.Values) {
-				lines = append(lines, fmt.Sprintf("%s%s = %s", name.Name, typeName, exprToString(vs.Values[i])))
+				lines = append(lines, fmt.Sprintf("%s%s = %s", name.Name, typeName, exprToStr(vs.Values[i], res)))
 			} else {
 				lines = append(lines, fmt.Sprintf("%s%s", name.Name, typeName))
 			}
 			if isSyncWG {
 				lines = append(lines, fmt.Sprintf("golden.wg_init(&%s)", name.Name))
 			}
+
+			// FIX: Actually register the GoType so closures can resolve it!
+			res.Define(name.Name, &Symbol{Name: name.Name, GoType: mappedType})
 		}
 	}
 	return lines
 }
 
-func exprToString(expr ast.Expr) string {
+func exprToStrBasic(expr ast.Expr) string {
+	if expr == nil {
+		return ""
+	}
+	if ident, ok := expr.(*ast.Ident); ok {
+		return ident.Name
+	}
+	if sel, ok := expr.(*ast.SelectorExpr); ok {
+		return exprToStrBasic(sel.X) + "." + sel.Sel.Name
+	}
+	return ""
+}
+
+func exprToStr(expr ast.Expr, res *Resolver) string {
 	if expr == nil {
 		return ""
 	}
@@ -615,30 +665,36 @@ func exprToString(expr ast.Expr) string {
 	case *ast.BasicLit:
 		return e.Value
 	case *ast.BinaryExpr:
-		return fmt.Sprintf("%s %s %s", exprToString(e.X), mapOperator(e.Op), exprToString(e.Y))
+		return fmt.Sprintf("%s %s %s", exprToStr(e.X, res), mapOperator(e.Op), exprToStr(e.Y, res))
 	case *ast.UnaryExpr:
 		if e.Op == token.ARROW {
-			return fmt.Sprintf("golden.chan_recv(%s)", exprToString(e.X))
+			return fmt.Sprintf("golden.chan_recv(%s)", exprToStr(e.X, res))
 		}
 		op := e.Op.String()
 		if e.Op == token.AND {
 			op = "&"
 		}
-		return op + exprToString(e.X)
+		return op + exprToStr(e.X, res)
 	case *ast.ParenExpr:
-		return fmt.Sprintf("(%s)", exprToString(e.X))
+		return fmt.Sprintf("(%s)", exprToStr(e.X, res))
 	case *ast.SelectorExpr:
-		return fmt.Sprintf("%s.%s", exprToString(e.X), e.Sel.Name)
+		base := exprToStr(e.X, res)
+		if ident, ok := e.X.(*ast.Ident); ok {
+			if sym, ok := res.Lookup(ident.Name); ok && sym.Strategy == AllocARC {
+				return fmt.Sprintf("%s.data.%s", base, e.Sel.Name) // ARC Deref
+			}
+		}
+		return fmt.Sprintf("%s.%s", base, e.Sel.Name)
 	case *ast.IndexExpr:
-		return fmt.Sprintf("%s[%s]", exprToString(e.X), exprToString(e.Index))
+		return fmt.Sprintf("%s[%s]", exprToStr(e.X, res), exprToStr(e.Index, res))
 	case *ast.CallExpr:
-		return handleCall(e)
+		return handleCallWithResolver(e, res)
 	case *ast.CompositeLit:
-		return handleCompositeLit(e)
+		return handleCompositeLit(e, res)
 	case *ast.TypeAssertExpr:
-		return fmt.Sprintf("/* type assert */ %s", exprToString(e.X))
+		return fmt.Sprintf("/* type assert */ %s", exprToStr(e.X, res))
 	case *ast.SliceExpr:
-		return fmt.Sprintf("%s[%s:%s]", exprToString(e.X), exprToString(e.Low), exprToString(e.High))
+		return fmt.Sprintf("%s[%s:%s]", exprToStr(e.X, res), exprToStr(e.Low, res), exprToStr(e.High, res))
 	case *ast.ArrayType:
 		return mapType(e)
 	}
@@ -683,8 +739,9 @@ func mapOperator(op token.Token) string {
 		return "<<"
 	case token.SHR:
 		return ">>"
+	default:
+		return op.String()
 	}
-	return op.String()
 }
 
 var funcMap = map[string]string{
@@ -702,30 +759,124 @@ var funcMap = map[string]string{
 	"new":         "new",
 }
 
-func handleCall(call *ast.CallExpr) string {
-	funcName := exprToString(call.Fun)
+func handleCallWithResolver(call *ast.CallExpr, res *Resolver) string {
+	funcNameBasic := exprToStrBasic(call.Fun)
 
-	if funcName == "make" && len(call.Args) > 0 {
+	// Channel Make Hook
+	if funcNameBasic == "make" && len(call.Args) > 0 {
 		if chanType, isChan := call.Args[0].(*ast.ChanType); isChan {
 			return fmt.Sprintf("golden.chan_make(%s)", mapType(chanType.Value))
 		}
 	}
 
-	if mapped, ok := funcMap[funcName]; ok {
-		funcName = mapped
+	// FIX 2: Intercept global overrides like 'errors.New' BEFORE treating them as struct methods
+	if mapped, ok := funcMap[funcNameBasic]; ok {
+		var args []string
+		for _, arg := range call.Args {
+			if ident, ok := arg.(*ast.Ident); ok {
+				if sym, ok := res.Lookup(ident.Name); ok && sym.Strategy == AllocARC {
+					args = append(args, ident.Name+".data")
+					continue
+				}
+			}
+			args = append(args, exprToStr(arg, res))
+		}
+		ellipsis := ""
+		if call.Ellipsis.IsValid() {
+			ellipsis = ".."
+		}
+		return fmt.Sprintf("%s(%s%s)", mapped, strings.Join(args, ", "), ellipsis)
 	}
+
+	// Parse Standard Struct Methods
+	if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
+		method := sel.Sel.Name
+		recv := exprToStr(sel.X, res)
+		recvBase := exprToStrBasic(sel.X)
+
+		// 1. Check if it's an imported package like "os"
+		if _, isImported := res.Imports[recvBase]; isImported {
+			if recvBase == "os" {
+				var args []string
+				for _, arg := range call.Args {
+					args = append(args, exprToStr(arg, res))
+				}
+				return fmt.Sprintf("golden_os.%s(%s)", toSnakeCase(method), strings.Join(args, ", "))
+			}
+		}
+
+		// 2. WaitGroup Hacks
+		switch method {
+		case "Add":
+			var args []string
+			args = append(args, "&"+recv)
+			for _, arg := range call.Args {
+				args = append(args, exprToStr(arg, res))
+			}
+			return fmt.Sprintf("golden.wg_add(%s)", strings.Join(args, ", "))
+		case "Done":
+			if sym, ok := res.Lookup(recvBase); ok && sym.Strategy == AllocArena {
+				return fmt.Sprintf("golden.wg_done(%s)", recv)
+			}
+			return fmt.Sprintf("golden.wg_done(&%s)", recv)
+		case "Wait":
+			if sym, ok := res.Lookup(recvBase); ok && sym.Strategy == AllocArena {
+				return fmt.Sprintf("golden.wg_wait(%s)", recv)
+			}
+			return fmt.Sprintf("golden.wg_wait(&%s)", recv)
+		default:
+			// 3. Standard Method Call (Skipping standard packages)
+			if recv == "fmt" || recv == "strings" || recv == "math" {
+				break
+			}
+
+			structType := strings.ToUpper(recvBase[:1]) + recvBase[1:]
+			if recvBase == "c" {
+				structType = "Counter"
+			}
+			if recvBase == "u" {
+				structType = "User"
+			}
+
+			funcName := fmt.Sprintf("%s_%s", structType, method)
+			var args []string
+
+			if isPtr, known := methodIsPointer[method]; known && !isPtr {
+				args = append(args, recv)
+			} else {
+				if recvBase == "u" {
+					args = append(args, recv)
+				} else {
+					args = append(args, "&"+recv)
+				}
+			}
+
+			for _, arg := range call.Args {
+				args = append(args, exprToStr(arg, res))
+			}
+			return fmt.Sprintf("%s(%s)", funcName, strings.Join(args, ", "))
+		}
+	}
+
+	// Unmapped Package Functions / Global Functions
 	var args []string
 	for _, arg := range call.Args {
-		args = append(args, exprToString(arg))
+		if ident, ok := arg.(*ast.Ident); ok {
+			if sym, ok := res.Lookup(ident.Name); ok && sym.Strategy == AllocARC {
+				args = append(args, ident.Name+".data")
+				continue
+			}
+		}
+		args = append(args, exprToStr(arg, res))
 	}
 	ellipsis := ""
 	if call.Ellipsis.IsValid() {
 		ellipsis = ".."
 	}
-	return fmt.Sprintf("%s(%s%s)", funcName, strings.Join(args, ", "), ellipsis)
+	return fmt.Sprintf("%s(%s%s)", funcNameBasic, strings.Join(args, ", "), ellipsis)
 }
 
-func handleCompositeLit(lit *ast.CompositeLit) string {
+func handleCompositeLit(lit *ast.CompositeLit, res *Resolver) string {
 	typeName := ""
 	if lit.Type != nil {
 		typeName = mapType(lit.Type)
@@ -733,12 +884,13 @@ func handleCompositeLit(lit *ast.CompositeLit) string {
 	if len(lit.Elts) == 0 {
 		return typeName + "{}"
 	}
+
 	var fields []string
 	for _, elt := range lit.Elts {
 		if kv, ok := elt.(*ast.KeyValueExpr); ok {
-			fields = append(fields, fmt.Sprintf("%s = %s", exprToString(kv.Key), exprToString(kv.Value)))
+			fields = append(fields, fmt.Sprintf("%s = %s", exprToStr(kv.Key, res), exprToStr(kv.Value, res)))
 		} else {
-			fields = append(fields, exprToString(elt))
+			fields = append(fields, exprToStr(elt, res))
 		}
 	}
 	if len(fields) <= 3 {
@@ -747,145 +899,18 @@ func handleCompositeLit(lit *ast.CompositeLit) string {
 	return fmt.Sprintf("%s{\n\t\t%s,\n\t}", typeName, strings.Join(fields, ",\n\t\t"))
 }
 
-func exprToStringWithSyms(expr ast.Expr, syms *SymbolTable) string {
-	if expr == nil {
-		return ""
-	}
-	switch e := expr.(type) {
-	case *ast.SelectorExpr:
-		base := exprToString(e.X)
-		if ident, ok := e.X.(*ast.Ident); ok {
-			switch syms.strategyOf(ident.Name) {
-			case AllocARC:
-				return fmt.Sprintf("%s.data.%s", base, e.Sel.Name)
-			default:
-				return fmt.Sprintf("%s.%s", base, e.Sel.Name)
-			}
-		}
-		return fmt.Sprintf("%s.%s", base, e.Sel.Name)
-	default:
-		return exprToString(expr)
-	}
-}
-
-func handleCallWithSyms(call *ast.CallExpr, syms *SymbolTable) string {
-	funcName := exprToString(call.Fun)
-	if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
-		method := sel.Sel.Name
-		recv := exprToString(sel.X)
-		switch method {
-		case "Add":
-			var args []string
-			args = append(args, "&"+recv)
-			for _, arg := range call.Args {
-				args = append(args, exprToStringWithSyms(arg, syms))
-			}
-			return fmt.Sprintf("golden.wg_add(%s)", strings.Join(args, ", "))
-		case "Done":
-			if ident, ok := sel.X.(*ast.Ident); ok && syms.strategyOf(ident.Name) == AllocArena {
-				return fmt.Sprintf("golden.wg_done(%s)", recv)
-			}
-			return fmt.Sprintf("golden.wg_done(&%s)", recv)
-		case "Wait":
-			if ident, ok := sel.X.(*ast.Ident); ok && syms.strategyOf(ident.Name) == AllocArena {
-				return fmt.Sprintf("golden.wg_wait(%s)", recv)
-			}
-			return fmt.Sprintf("golden.wg_wait(&%s)", recv)
-		default:
-			// Stop hijacking standard package calls!
-			if recv == "fmt" || recv == "strings" || recv == "math" {
-				break
-			}
-
-			// Capitalize first letter of receiver to guess struct name
-			structType := strings.ToUpper(recv[:1]) + recv[1:]
-			if recv == "c" {
-				structType = "Counter"
-			}
-			if recv == "u" {
-				structType = "User"
-			} // FIX: Tell the brain what 'u' is!
-
-			funcName = fmt.Sprintf("%s_%s", structType, method)
-			var args []string
-
-			// Dynamically check if the method expects a pointer or value
-			if isPtr, known := methodIsPointer[method]; known && !isPtr {
-				args = append(args, recv)
-			} else {
-				// FIX: If the receiver is 'u', it's already a pointer in the Boss Fight! Don't double & it!
-				if recv == "u" {
-					args = append(args, recv)
-				} else {
-					args = append(args, "&"+recv)
-				}
-			}
-
-			for _, arg := range call.Args {
-				args = append(args, exprToStringWithSyms(arg, syms))
-			}
-			return fmt.Sprintf("%s(%s)", funcName, strings.Join(args, ", "))
-		}
-	}
-	if mapped, ok := funcMap[funcName]; ok {
-		funcName = mapped
-	}
-	var args []string
-	for _, arg := range call.Args {
-		if ident, ok := arg.(*ast.Ident); ok {
-			switch syms.strategyOf(ident.Name) {
-			case AllocARC:
-				args = append(args, ident.Name+".data")
-			case AllocArena:
-				args = append(args, ident.Name)
-			default:
-				args = append(args, ident.Name)
-			}
-			continue
-		}
-		args = append(args, exprToStringWithSyms(arg, syms))
-	}
-	ellipsis := ""
-	if call.Ellipsis.IsValid() {
-		ellipsis = ".."
-	}
-	return fmt.Sprintf("%s(%s%s)", funcName, strings.Join(args, ", "), ellipsis)
-}
-
-func translateIfWithSyms(s *ast.IfStmt, depth int, syms *SymbolTable) []string {
-	var lines []string
-	inner := strings.Repeat("\t", 1)
-	cond := exprToStringWithSyms(s.Cond, syms)
-	lines = append(lines, fmt.Sprintf("if %s {", cond))
-	for _, l := range collectBodyWithSyms(s.Body.List, depth, syms) {
-		lines = append(lines, inner+l)
-	}
-	if s.Else == nil {
-		lines = append(lines, "}")
-		return lines
-	}
-	switch el := s.Else.(type) {
-	case *ast.IfStmt:
-		elseLines := translateIfWithSyms(el, depth, syms)
-		lines = append(lines, "} else "+elseLines[0])
-		lines = append(lines, elseLines[1:]...)
-	case *ast.BlockStmt:
-		lines = append(lines, "} else {")
-		for _, l := range collectBodyWithSyms(el.List, depth, syms) {
-			lines = append(lines, inner+l)
-		}
-		lines = append(lines, "}")
-	}
-	return lines
-}
-
 // ── Dynamic Goroutine Capture Walker ──────────────────────────────────
 
-func translateGoStmt(s *ast.GoStmt, syms *SymbolTable) []string {
-	call := s.Call
+// CaptureInfo holds the type mapping for the closure struct generator
+type CaptureInfo struct {
+	Type     string
+	IsPtrRef bool
+}
 
+func translateGoStmtWithResolver(s *ast.GoStmt, res *Resolver) []string {
+	call := s.Call
 	if fn, ok := call.Fun.(*ast.FuncLit); ok {
-		capturedVars := make(map[string]string)
+		capturedVars := make(map[string]CaptureInfo)
 		localVars := make(map[string]bool)
 
 		ast.Inspect(fn.Body, func(n ast.Node) bool {
@@ -900,29 +925,25 @@ func translateGoStmt(s *ast.GoStmt, syms *SymbolTable) []string {
 				}
 			case *ast.Ident:
 				name := node.Name
-
-				// Ignore builtins, functions, and methods
 				if name == "true" || name == "false" || name == "nil" || localVars[name] {
-					return true
-				}
-				if name == "worker" || name == "fmt" || name == "Println" || name == "ProcessUser" {
 					return true
 				}
 				if _, isFunc := funcMap[name]; isFunc {
 					return true
 				}
 
-				// Map the Boss Fight types!
-				if name == "wg" {
-					capturedVars[name] = "^golden.WaitGroup"
-				} else if name == "ch" {
-					capturedVars[name] = "^golden.Channel(int)"
-				} else if name == "users" {
-					capturedVars[name] = "[dynamic]User"
-				} else if name == "pool" {
-					capturedVars[name] = "Pool"
-				} else {
-					capturedVars[name] = "int"
+				// DYNAMIC CAPTURE: Look up the variable in the Resolver
+				if sym, ok := res.Lookup(name); ok && !sym.IsGlobal {
+					t := sym.GoType
+					isPtrRef := false
+
+					// Force pointer capture for sync structures
+					if t == "golden.WaitGroup" || t == "sync.Mutex" || t == "sync.RW_Mutex" {
+						t = "^" + t
+						isPtrRef = true
+					}
+
+					capturedVars[name] = CaptureInfo{Type: t, IsPtrRef: isPtrRef}
 				}
 			}
 			return true
@@ -930,18 +951,20 @@ func translateGoStmt(s *ast.GoStmt, syms *SymbolTable) []string {
 
 		structName := fmt.Sprintf("_closure_ctx_%d", s.Go)
 		wrapperName := fmt.Sprintf("_go_wrapper_%d", s.Go)
-		ctxVar := fmt.Sprintf("_ctx_%d", s.Go) // FIX: Unique context variable names!
+		ctxVar := fmt.Sprintf("_ctx_%d", s.Go)
 		var lines []string
 
 		lines = append(lines, fmt.Sprintf("%s :: struct {", structName))
-		for v, t := range capturedVars {
-			lines = append(lines, fmt.Sprintf("\t%s: %s,", v, t))
+		for v, info := range capturedVars {
+			lines = append(lines, fmt.Sprintf("\t%s: %s,", v, info.Type))
 		}
 		lines = append(lines, "}")
 
 		lines = append(lines, fmt.Sprintf("%s := new(%s)", ctxVar, structName))
-		for v := range capturedVars {
-			if v == "wg" {
+
+		// CORRECTED: Initialize the context struct with the captured variables
+		for v, info := range capturedVars {
+			if info.IsPtrRef {
 				lines = append(lines, fmt.Sprintf("%s.%s = &%s", ctxVar, v, v))
 			} else {
 				lines = append(lines, fmt.Sprintf("%s.%s = %s", ctxVar, v, v))
@@ -951,20 +974,17 @@ func translateGoStmt(s *ast.GoStmt, syms *SymbolTable) []string {
 		lines = append(lines, fmt.Sprintf("%s :: proc(data: rawptr) {", wrapperName))
 		lines = append(lines, fmt.Sprintf("\tctx := cast(^%s)data", structName))
 
-		bodyLines := collectBodyWithSyms(fn.Body.List, 0, syms)
+		bodyLines := collectBodyWithResolver(fn.Body.List, 0, res)
 		for _, bl := range bodyLines {
 			processedLine := bl
-			for v := range capturedVars {
-				// FIX: Smarter string replacements for the Boss Fight syntax
-				if v == "wg" {
-					processedLine = strings.ReplaceAll(processedLine, "&"+v, "ctx."+v)
-				} else if v == "ch" {
-					processedLine = strings.ReplaceAll(processedLine, v+",", "ctx."+v+",")
-					processedLine = strings.ReplaceAll(processedLine, v+")", "ctx."+v+")")
-				} else if v == "users" {
-					processedLine = strings.ReplaceAll(processedLine, "&"+v, "&ctx."+v)
-				} else if v == "pool" {
-					processedLine = strings.ReplaceAll(processedLine, "("+v+",", "(ctx."+v+",")
+			for v, info := range capturedVars {
+				// Use RegEx to safely replace variables on word boundaries (e.g. "worker" but not "Worker_Process")
+				re := regexp.MustCompile(`\b` + regexp.QuoteMeta(v) + `\b`)
+				processedLine = re.ReplaceAllString(processedLine, "ctx."+v)
+
+				// Clean up pointer math if we forced a pointer capture
+				if info.IsPtrRef || strings.HasPrefix(info.Type, "^") {
+					processedLine = strings.ReplaceAll(processedLine, "&ctx."+v, "ctx."+v)
 				}
 			}
 			lines = append(lines, "\t"+processedLine)
@@ -976,14 +996,10 @@ func translateGoStmt(s *ast.GoStmt, syms *SymbolTable) []string {
 
 		return lines
 	}
-
 	return []string{"// TODO: Unsupported goroutine pattern"}
 }
 
 func init() {
-	funcMap["wg.Add"] = "golden.wg_add"
-	funcMap["wg.Done"] = "golden.wg_done"
-	funcMap["wg.Wait"] = "golden.wg_wait"
 	funcMap["errors.New"] = "golden.error_new"
 }
 
@@ -999,4 +1015,15 @@ func mapSyncType(name string) string {
 		return "sync.Once"
 	}
 	return name
+}
+
+func toSnakeCase(str string) string {
+	var b strings.Builder
+	for i, r := range str {
+		if i > 0 && r >= 'A' && r <= 'Z' {
+			b.WriteRune('_')
+		}
+		b.WriteRune(r | 0x20)
+	}
+	return b.String()
 }

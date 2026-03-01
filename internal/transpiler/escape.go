@@ -1,4 +1,4 @@
-// --- golden/internal/transpiler/escape.odin ---
+// --- golden/internal/transpiler/escape.go ---
 
 package transpiler
 
